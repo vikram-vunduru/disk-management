@@ -143,4 +143,5 @@ Use this view to:
 ## Author
 
 Vikram Vunduru  
-For support, reach out on LinkedIn: https://www.linkedin.com/in/vikram-vunduru/
+Portfolio: https://www.vikramvunduru.com  
+For support, email: vikram.vunduru@gmail.com

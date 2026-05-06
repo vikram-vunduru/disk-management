@@ -1,5 +1,6 @@
 import json
 import os
+import secrets
 import shutil
 import socket
 import subprocess
@@ -25,6 +26,10 @@ _cache = {
     "region_support": {},
 }
 
+_operations_lock = threading.Lock()
+_operations = {}
+OPERATION_RETENTION_SECONDS = 3600
+
 
 HTML = """<!doctype html>
 <html lang="en">
@@ -34,121 +39,319 @@ HTML = """<!doctype html>
   <title>Azure Disk Dashboard</title>
   <style>
     :root {
-      --bg: #f3f9fd;
+      color-scheme: light;
+      --bg: #f8fafc;
+      --bg-grad-1: #eef2ff;
+      --bg-grad-2: #f8fafc;
       --paper: #ffffff;
-      --ink: #1b1a19;
-      --muted: #605e5c;
-      --line: #d2d0ce;
-      --accent: #0078d4;
-      --accent-2: #106ebe;
-      --warn: #8a6d1f;
-      --danger: #a4262c;
-      --shadow: rgba(0, 120, 212, 0.10);
+      --paper-2: #f8fafc;
+      --ink: #0f172a;
+      --ink-soft: #334155;
+      --muted: #64748b;
+      --line: #e2e8f0;
+      --line-strong: #cbd5e1;
+      --accent: #6366f1;
+      --accent-strong: #4f46e5;
+      --accent-soft: #eef2ff;
+      --success: #10b981;
+      --success-soft: #d1fae5;
+      --success-ink: #047857;
+      --warn: #f59e0b;
+      --warn-soft: #fef3c7;
+      --warn-ink: #b45309;
+      --danger: #ef4444;
+      --danger-soft: #fee2e2;
+      --danger-ink: #b91c1c;
+      --shadow-sm: 0 1px 2px rgb(15 23 42 / 0.04);
+      --shadow-md: 0 4px 16px -4px rgb(15 23 42 / 0.08), 0 1px 3px rgb(15 23 42 / 0.05);
+      --shadow-lg: 0 12px 32px -8px rgb(99 102 241 / 0.18);
+      --radius-sm: 6px;
+      --radius-md: 10px;
+      --radius-lg: 14px;
+      --radius-xl: 20px;
     }
 
     * { box-sizing: border-box; }
+    html, body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
     body {
       margin: 0;
-      font-family: "Bahnschrift", "Trebuchet MS", sans-serif;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", "Roboto", sans-serif;
+      font-size: 14px;
       color: var(--ink);
       background:
-        radial-gradient(circle at top left, rgba(0,120,212,0.10), transparent 28%),
-        radial-gradient(circle at top right, rgba(16,110,190,0.08), transparent 34%),
-        linear-gradient(180deg, #f8fbfd 0%, var(--bg) 100%);
+        radial-gradient(1200px 600px at 110% -10%, rgb(99 102 241 / 0.10), transparent 60%),
+        radial-gradient(900px 500px at -10% 0%, rgb(16 185 129 / 0.06), transparent 55%),
+        linear-gradient(180deg, var(--bg-grad-1) 0%, var(--bg-grad-2) 220px, var(--bg) 100%);
+      min-height: 100vh;
     }
+    a { color: var(--accent-strong); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
     .shell {
       max-width: 1520px;
       margin: 0 auto;
-      padding: 16px;
+      padding: 24px;
     }
+
     .hero {
-      background: linear-gradient(135deg, rgba(0,120,212,0.96), rgba(16,110,190,0.96));
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 6px 4px 18px;
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 18px;
+    }
+    .hero-brand {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .hero-logo {
+      width: 40px;
+      height: 40px;
+      border-radius: 12px;
+      background: linear-gradient(135deg, var(--accent), #8b5cf6);
+      display: grid;
+      place-items: center;
       color: white;
-      border-radius: 24px;
-      padding: 20px 22px;
-      box-shadow: 0 18px 40px var(--shadow);
+      font-weight: 800;
+      font-size: 18px;
+      box-shadow: var(--shadow-lg);
     }
     .hero h1 {
-      margin: 0 0 8px;
-      font-family: Georgia, "Times New Roman", serif;
-      font-size: 2.2rem;
+      margin: 0;
+      font-size: 1.35rem;
       font-weight: 700;
+      letter-spacing: -0.015em;
     }
     .hero p {
-      margin: 0;
-      max-width: 840px;
-      line-height: 1.5;
-      color: rgba(255,255,255,0.9);
-    }
-    .layout {
-      display: grid;
-      grid-template-columns: 260px minmax(0, 1fr);
-      gap: 14px;
-      align-items: start;
-      margin-top: 14px;
-    }
-    .panel {
-      margin-top: 14px;
-      background: var(--paper);
-      border: 1px solid var(--line);
-      border-radius: 20px;
-      padding: 20px;
-      box-shadow: 0 10px 24px var(--shadow);
-    }
-    .layout .panel {
-      margin-top: 0;
-    }
-    .sidebar {
-      position: sticky;
-      top: 16px;
-      background: linear-gradient(180deg, #f8fbfd, #eef6fc);
-    }
-    .sidebar h2 {
-      margin: 0 0 6px;
-      font-size: 1.15rem;
-    }
-    .sidebar p {
-      margin: 0 0 10px;
+      margin: 2px 0 0;
       color: var(--muted);
-      line-height: 1.5;
-      font-size: 0.92rem;
+      font-size: 0.875rem;
+      max-width: 720px;
+      line-height: 1.45;
     }
-    .nav {
+    .hero-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 0.78rem;
+    }
+    .hero-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent-strong);
+      font-weight: 600;
+      font-size: 0.75rem;
+      letter-spacing: 0.02em;
+    }
+    .hero-pill::before {
+      content: "";
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 0 3px rgb(99 102 241 / 0.18);
+    }
+
+    .docs { margin-bottom: 18px; }
+    .docs-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+    .docs-header h2 { margin: 0 0 4px; }
+    .docs-tagline { margin: 0; color: var(--muted); font-size: 0.86rem; line-height: 1.45; }
+    .docs-toggle {
+      background: var(--paper-2);
+      border: 1px solid var(--line);
+      color: var(--ink-soft);
+      padding: 6px 14px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      min-height: 30px;
+      width: auto;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .docs-toggle:hover { background: var(--accent-soft); color: var(--accent-strong); border-color: rgb(99 102 241 / 0.25); }
+    .docs-grid {
       display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    .docs-section {
+      background: var(--paper-2);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      padding: 14px 16px;
+    }
+    .docs-section h3 {
+      margin: 0 0 10px;
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--accent-strong);
+      font-weight: 700;
+      display: flex;
+      align-items: center;
       gap: 8px;
     }
+    .docs-section h3::before {
+      content: "";
+      width: 4px;
+      height: 14px;
+      background: var(--accent);
+      border-radius: 2px;
+    }
+    .docs-section p, .docs-section li {
+      font-size: 0.86rem;
+      color: var(--ink-soft);
+      line-height: 1.55;
+    }
+    .docs-section p { margin: 0 0 8px; }
+    .docs-section p:last-child { margin-bottom: 0; }
+    .docs-section ol, .docs-section ul {
+      margin: 0;
+      padding-left: 20px;
+    }
+    .docs-section li { margin: 5px 0; }
+    .docs-section li strong { color: var(--ink); font-weight: 600; }
+    .docs-section code {
+      background: rgba(99, 102, 241, 0.10);
+      color: var(--accent-strong);
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-size: 0.8rem;
+      font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace;
+    }
+    .docs-section .legend-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 6px 0;
+      font-size: 0.86rem;
+      color: var(--ink-soft);
+    }
+    .docs-flags { padding: 16px 18px; }
+    .flag-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+      min-width: 0;
+    }
+    .flag-table th, .flag-table td {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+    .flag-table th {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .flag-table td:first-child {
+      font-weight: 600;
+      color: var(--ink);
+      white-space: nowrap;
+    }
+    .flag-table tr:last-child td { border-bottom: none; }
+    .flag-good { color: var(--success-ink); font-weight: 600; }
+    .flag-bad  { color: var(--danger-ink); font-weight: 600; }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 248px minmax(0, 1fr);
+      gap: 18px;
+      align-items: start;
+    }
+
+    .panel {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-xl);
+      padding: 20px;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .sidebar {
+      position: sticky;
+      top: 24px;
+      padding: 16px;
+      background: var(--paper);
+    }
+    .sidebar h2 {
+      margin: 4px 0 4px;
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .sidebar p {
+      margin: 0 0 12px;
+      color: var(--muted);
+      line-height: 1.5;
+      font-size: 0.83rem;
+    }
+    .nav { display: grid; gap: 4px; }
     .nav button {
+      width: 100%;
       text-align: left;
       padding: 10px 12px;
-      border-radius: 16px;
-      background: white;
-      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--ink-soft);
+      font-weight: 600;
+      font-size: 0.92rem;
+      transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+      box-shadow: none;
+      min-height: 0;
+      display: block;
+    }
+    .nav button:hover {
+      background: var(--paper-2);
       color: var(--ink);
+      transform: none;
       box-shadow: none;
     }
     .nav button.active {
-      background: linear-gradient(135deg, rgba(0,120,212,0.96), rgba(16,110,190,0.96));
-      border-color: transparent;
-      color: white;
+      background: var(--accent-soft);
+      color: var(--accent-strong);
+      border-color: rgb(99 102 241 / 0.20);
     }
     .nav button small {
       display: block;
-      margin-top: 4px;
-      opacity: 0.8;
-      font-size: 0.82rem;
+      margin-top: 3px;
+      font-size: 0.75rem;
       font-weight: 500;
+      color: var(--muted);
+      letter-spacing: 0;
     }
-    .workspace {
-      min-width: 0;
-    }
-    .controls {
-      display: grid;
-      gap: 10px;
-    }
+    .nav button.active small { color: var(--accent-strong); opacity: 0.7; }
+
+    .workspace { min-width: 0; }
+
+    .controls { display: grid; gap: 14px; }
     .control-fields {
       display: grid;
       grid-template-columns: minmax(320px, 1.8fr) minmax(240px, 1.2fr);
-      gap: 10px;
+      gap: 12px;
       align-items: end;
     }
     .control-actions {
@@ -156,68 +359,86 @@ HTML = """<!doctype html>
       flex-wrap: wrap;
       gap: 8px;
       align-items: center;
-      max-width: 1080px;
     }
-    .action-group {
-      display: contents;
-    }
-    .action-group-title {
-      display: none;
-    }
+    .action-group { display: contents; }
+    .action-group.context-hidden { display: none; }
+
     .field label {
       display: block;
       margin-bottom: 6px;
-      color: var(--muted);
-      font-size: 0.9rem;
-      font-weight: 700;
+      color: var(--ink-soft);
+      font-size: 0.78rem;
+      font-weight: 600;
+      letter-spacing: 0.01em;
     }
     select, input, button {
       width: 100%;
-      min-height: 42px;
-      border-radius: 12px;
+      min-height: 38px;
+      border-radius: var(--radius-md);
       border: 1px solid var(--line);
-      padding: 9px 12px;
+      padding: 8px 12px;
       font: inherit;
-      background: white;
+      font-size: 0.92rem;
+      background: var(--paper);
       color: var(--ink);
+      transition: border-color 120ms ease, box-shadow 120ms ease, background 120ms ease;
     }
-    select, input {
-      font-size: 0.95rem;
+    select:focus, input:focus, button:focus-visible {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgb(99 102 241 / 0.15);
     }
     button {
       cursor: pointer;
-      font-weight: 700;
-      transition: transform 120ms ease, box-shadow 120ms ease, background 120ms ease;
+      font-weight: 600;
       width: auto;
-      min-width: 118px;
+      min-width: 0;
       white-space: nowrap;
+      letter-spacing: -0.005em;
     }
-    button:hover {
-      transform: translateY(-1px);
-      box-shadow: 0 10px 18px var(--shadow);
+    button:hover { background: var(--paper-2); }
+    .primary {
+      background: var(--accent);
+      color: white;
+      border-color: transparent;
+      box-shadow: var(--shadow-sm);
     }
-    .primary { background: var(--accent); color: white; border-color: var(--accent); }
-    .secondary { background: #fff; }
-    .export { background: #eff6fc; border-color: #9fd3ff; }
+    .primary:hover { background: var(--accent-strong); box-shadow: var(--shadow-md); }
+    .secondary { background: var(--paper); color: var(--ink); }
+    .secondary:hover { background: var(--paper-2); border-color: var(--line-strong); }
+    .export {
+      background: var(--accent-soft);
+      color: var(--accent-strong);
+      border-color: rgb(99 102 241 / 0.18);
+    }
+    .export:hover { background: rgb(99 102 241 / 0.10); }
+
     .checkbox-card {
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      min-height: 42px;
+      min-height: 38px;
       padding: 0 12px;
-      border-radius: 12px;
+      border-radius: var(--radius-md);
       border: 1px solid var(--line);
-      background: white;
-      font-weight: 700;
+      background: var(--paper);
+      font-weight: 600;
+      font-size: 0.88rem;
+      color: var(--ink-soft);
       white-space: nowrap;
+      cursor: pointer;
+      transition: background 120ms ease, border-color 120ms ease;
     }
+    .checkbox-card:hover { background: var(--paper-2); }
     .checkbox-card input {
-      width: 18px;
-      height: 18px;
-      min-height: 18px;
+      width: 16px;
+      height: 16px;
+      min-height: 16px;
       margin: 0;
       padding: 0;
+      accent-color: var(--accent);
     }
+
     .summary {
       display: grid;
       grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -225,82 +446,98 @@ HTML = """<!doctype html>
       margin-top: 18px;
     }
     .card {
-      background: white;
+      background: var(--paper);
       border: 1px solid var(--line);
-      border-radius: 18px;
-      padding: 16px;
+      border-radius: var(--radius-lg);
+      padding: 14px 16px;
+      transition: border-color 120ms ease, box-shadow 120ms ease;
     }
+    .card:hover { border-color: var(--line-strong); }
     .card .label {
       color: var(--muted);
-      font-size: 0.9rem;
-      margin-bottom: 8px;
+      font-size: 0.74rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      margin-bottom: 6px;
     }
     .card .value {
-      font-size: 1.9rem;
-      font-weight: 800;
+      font-size: 1.6rem;
+      font-weight: 700;
+      letter-spacing: -0.025em;
+      color: var(--ink);
     }
-    .card.accent .value { color: var(--accent); }
-    .card.warn .value { color: var(--warn); }
-    .card.danger .value { color: var(--danger); }
+    .card.accent .value { color: var(--accent-strong); }
+    .card.warn .value { color: var(--warn-ink); }
+    .card.danger .value { color: var(--danger-ink); }
+
     .meta {
-      margin-top: 14px;
+      margin-top: 12px;
       color: var(--muted);
-      font-size: 0.92rem;
+      font-size: 0.83rem;
     }
-    .view-stack {
-      display: grid;
-      gap: 20px;
-      margin-top: 20px;
-    }
-    .view {
-      display: none;
-    }
-    .view.active {
-      display: grid;
-      gap: 20px;
-    }
+
+    .view-stack { display: grid; gap: 18px; margin-top: 18px; }
+    .view { display: none; }
+    .view.active { display: grid; gap: 18px; }
+
     .footer-note {
-      margin-top: 18px;
-      padding: 14px 16px;
-      border-radius: 16px;
+      margin-top: 24px;
+      padding: 14px 18px;
+      border-radius: var(--radius-lg);
       border: 1px solid var(--line);
-      background: rgba(255,255,255,0.72);
+      background: var(--paper);
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 12px;
       color: var(--muted);
+      font-size: 0.85rem;
     }
-    .footer-copy {
-      line-height: 1.45;
+    .footer-copy { line-height: 1.45; }
+    .footer-note strong { color: var(--ink); }
+    .footer-links {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
     }
-    .footer-note strong {
-      color: var(--ink);
-    }
-    .linkedin-btn {
+    .email-btn, .website-btn {
       display: inline-flex;
       align-items: center;
       justify-content: center;
       gap: 8px;
-      min-width: 130px;
-      min-height: 40px;
-      padding: 8px 14px;
+      min-width: 0;
+      min-height: 36px;
+      padding: 6px 14px;
       border-radius: 999px;
-      background: #0078d4;
-      color: white;
       text-decoration: none;
-      font-weight: 700;
+      font-weight: 600;
+      font-size: 0.85rem;
+      letter-spacing: -0.005em;
+      transition: background 120ms ease, border-color 120ms ease;
     }
+    .email-btn { background: var(--ink); color: white; }
+    .email-btn:hover { background: #1e293b; text-decoration: none; }
+    .website-btn {
+      background: var(--accent-soft);
+      color: var(--accent-strong);
+      border: 1px solid rgb(99 102 241 / 0.25);
+    }
+    .website-btn:hover { background: rgb(99 102 241 / 0.12); text-decoration: none; }
+
     h2 {
-      margin: 0 0 12px;
-      font-family: Georgia, "Times New Roman", serif;
-      font-size: 1.35rem;
+      margin: 0 0 14px;
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: -0.015em;
+      color: var(--ink);
     }
+
     .table-wrap {
       overflow: auto;
       border: 1px solid var(--line);
-      border-radius: 16px;
-      background: white;
+      border-radius: var(--radius-lg);
+      background: var(--paper);
     }
     table {
       width: 100%;
@@ -308,79 +545,239 @@ HTML = """<!doctype html>
       min-width: 920px;
     }
     th, td {
-      padding: 10px 12px;
-      border-bottom: 1px solid #edebe9;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--line);
       text-align: left;
-      vertical-align: top;
-      font-size: 0.95rem;
+      vertical-align: middle;
+      font-size: 0.86rem;
     }
     th {
       position: sticky;
       top: 0;
-      background: #f3f2f1;
+      background: var(--paper-2);
+      color: var(--ink-soft);
+      font-weight: 600;
+      font-size: 0.74rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
       z-index: 1;
+      border-bottom: 1px solid var(--line);
     }
+    tbody tr:last-child td { border-bottom: none; }
+    tbody tr:hover { background: var(--paper-2); }
+
     .pill {
       display: inline-block;
-      padding: 4px 10px;
+      padding: 3px 10px;
       border-radius: 999px;
-      font-size: 0.82rem;
-      font-weight: 700;
+      font-size: 0.74rem;
+      font-weight: 600;
+      letter-spacing: 0.005em;
       white-space: nowrap;
+      border: 1px solid transparent;
     }
-    .pill.v1 { background: #fff4ce; color: #8a6d1f; }
-    .pill.v2 { background: #dff6dd; color: #0b6a0b; }
-    .pill.other { background: #edebe9; color: #605e5c; }
-    .pill.ok { background: #dff6dd; color: #0b6a0b; }
-    .pill.no { background: #fde7e9; color: #a4262c; }
+    .pill.v1     { background: var(--warn-soft); color: var(--warn-ink); }
+    .pill.v2     { background: var(--success-soft); color: var(--success-ink); }
+    .pill.other  { background: var(--paper-2); color: var(--muted); border-color: var(--line); }
+    .pill.ok     { background: var(--success-soft); color: var(--success-ink); }
+    .pill.no     { background: var(--danger-soft); color: var(--danger-ink); }
+    .pill.flag-true    { background: var(--danger-soft); color: var(--danger-ink); }
+    .pill.flag-false   { background: var(--success-soft); color: var(--success-ink); }
+    .pill.flag-unknown { background: var(--paper-2); color: var(--muted); border-color: var(--line); }
+    .pill.status-green  { background: var(--success-soft); color: var(--success-ink); border-color: rgb(16 185 129 / 0.25); }
+    .pill.status-yellow { background: var(--warn-soft); color: var(--warn-ink); border-color: rgb(245 158 11 / 0.30); }
+    .pill.status-red    { background: var(--danger-soft); color: var(--danger-ink); border-color: rgb(239 68 68 / 0.25); }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 14px;
+      color: var(--muted);
+      font-size: 0.83rem;
+    }
+    .legend .pill { font-size: 0.72rem; }
+
     .notice {
-      margin-top: 16px;
-      padding: 14px 16px;
-      border-radius: 14px;
-      background: #eff6fc;
-      border: 1px solid #9fd3ff;
-      color: #004578;
+      margin-top: 14px;
+      padding: 12px 14px;
+      border-radius: var(--radius-md);
+      background: var(--accent-soft);
+      border: 1px solid rgb(99 102 241 / 0.20);
+      color: var(--accent-strong);
+      font-size: 0.86rem;
+      font-weight: 500;
       display: none;
     }
     .error {
-      background: #fde7e9;
-      border-color: #f1b7bb;
-      color: var(--danger);
+      background: var(--danger-soft);
+      border-color: rgb(239 68 68 / 0.30);
+      color: var(--danger-ink);
     }
+
+    .op-log {
+      margin-top: 12px;
+      padding: 14px 18px;
+      border-radius: var(--radius-md);
+      background: #0b1020;
+      color: #e2e8f0;
+      font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace;
+      font-size: 0.78rem;
+      max-height: 280px;
+      overflow: auto;
+      border: 1px solid #1e293b;
+    }
+    .op-log-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+      color: #94a3b8;
+      font-size: 0.74rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      font-weight: 600;
+    }
+    .op-log ol { margin: 0; padding-left: 0; }
+    .op-log li {
+      margin: 3px 0;
+      list-style: none;
+      padding-left: 22px;
+      position: relative;
+      line-height: 1.5;
+    }
+    .op-log li::before {
+      content: "\\2022";
+      position: absolute;
+      left: 6px;
+      color: #818cf8;
+    }
+    .op-log li.done::before { content: "\\2713"; color: #34d399; }
+    .op-log li.err::before  { content: "\\2717"; color: #f87171; }
+    .op-log .ts { color: #818cf8; margin-right: 10px; }
+    .op-log .err { color: #fca5a5; }
+
+    .icon-cell { font-size: 1.05rem; font-weight: 700; line-height: 1; }
+    .icon-yes { color: var(--success); }
+    .icon-no  { color: var(--danger); }
+    .icon-na  { color: var(--muted); }
+
+    .count-badge {
+      display: inline-block;
+      min-width: 20px;
+      padding: 1px 8px;
+      margin-left: 6px;
+      border-radius: 999px;
+      background: rgb(15 23 42 / 0.10);
+      color: inherit;
+      font-size: 0.74rem;
+      font-weight: 700;
+    }
+    .primary .count-badge { background: rgb(255 255 255 / 0.22); color: white; }
+    .secondary .count-badge { background: var(--paper-2); }
+
+    button:disabled,
+    button[aria-busy="true"] {
+      cursor: not-allowed;
+      opacity: 0.55;
+      transform: none;
+    }
+    button[aria-busy="true"]::after {
+      content: "";
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      margin-left: 8px;
+      vertical-align: -2px;
+      border: 2px solid currentColor;
+      border-right-color: transparent;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .table-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .table-toolbar input {
+      min-height: 36px;
+      max-width: 320px;
+      padding: 6px 12px 6px 32px;
+      border-radius: var(--radius-md);
+      font-size: 0.86rem;
+      background: var(--paper) url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='%2364748b'><path fill-rule='evenodd' d='M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.45 4.39l3.08 3.08a.75.75 0 11-1.06 1.06l-3.08-3.08A7 7 0 012 9z' clip-rule='evenodd'/></svg>") no-repeat 10px center / 14px 14px;
+    }
+    .row-count {
+      color: var(--muted);
+      font-size: 0.8rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .link-btn {
+      background: transparent;
+      border: none;
+      color: #94a3b8;
+      cursor: pointer;
+      padding: 0;
+      width: auto;
+      min-height: auto;
+      min-width: auto;
+      font-weight: 600;
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .link-btn:hover { color: #e2e8f0; background: transparent; }
+
     @media (max-width: 1100px) {
       .layout { grid-template-columns: 1fr; }
       .sidebar { position: static; }
       .control-fields { grid-template-columns: 1fr; }
       .control-actions { flex-wrap: wrap; }
-      .summary { grid-template-columns: 1fr 1fr; }
+      .summary { grid-template-columns: repeat(2, 1fr); }
+      .hero { flex-direction: column; align-items: flex-start; }
     }
     @media (max-width: 700px) {
       .shell { padding: 16px; }
       .summary { grid-template-columns: 1fr; }
-      .hero h1 { font-size: 1.8rem; }
+      .hero h1 { font-size: 1.2rem; }
+      .footer-note { flex-direction: column; align-items: flex-start; }
     }
   </style>
 </head>
 <body>
   <div class="shell">
-    <section class="hero">
-      <h1>Azure Disk Dashboard</h1>
-      <p>Review Azure managed disks by subscription, identify Premium SSD v1 disks for Premium SSD v2 migration, back up selected disks with snapshots, and clean up unattached disks from one dashboard.</p>
-    </section>
+    <header class="hero">
+      <div class="hero-brand">
+        <div class="hero-logo" aria-hidden="true">AZ</div>
+        <div>
+          <h1>Azure Disk Dashboard</h1>
+          <p>Inventory, V2 readiness, snapshots, and unattached cleanup &mdash; one workspace.</p>
+        </div>
+      </div>
+      <div class="hero-meta">
+        <span class="hero-pill">Premium SSD v2 readiness</span>
+      </div>
+    </header>
 
     <div class="layout">
       <aside class="panel sidebar">
-        <h2>Disk Views</h2>
-        <p>Move between full inventory, migration-ready disks, and unattached cleanup. Use the action bar to export CSV, create backups, migrate selected disks, or delete selected unattached disks.</p>
+        <h2>Views</h2>
         <div class="nav">
-          <button id="navAll" class="active">1. All Disks<small>Full managed disk inventory</small></button>
-          <button id="navEligible">2. Eligible Disks<small>V1 disks ready for migration</small></button>
-          <button id="navUnattached">3. Unattached Disks<small>Selection and cleanup workflow</small></button>
+          <button id="navDocs" class="active">Documentation<small>About this tool, flags, caveats</small></button>
+          <button id="navAll">All Disks<small>Full managed disk inventory</small></button>
+          <button id="navEligible">Premium LRS Data Disks<small>V2 readiness with attribute flags</small></button>
+          <button id="navUnattached">Unattached Disks<small>Selection and cleanup</small></button>
         </div>
       </aside>
 
       <section class="workspace">
-        <section class="panel">
+        <section class="panel" id="controlsPanel">
           <div class="controls">
             <div class="control-fields">
               <div class="field">
@@ -393,54 +790,229 @@ HTML = """<!doctype html>
               </div>
             </div>
             <div class="control-actions">
-              <div class="action-group">
+              <div class="action-group" data-context="all">
                 <button id="loadBtn" class="primary">Load Disks</button>
                 <button id="csvBtn" class="export">Export CSV</button>
               </div>
-              <div class="action-group">
+              <div class="action-group" data-context="eligible">
                 <label class="checkbox-card"><input id="backupBeforeMigration" type="checkbox"> Backup Before Migration</label>
-                <button id="backupSelectedBtn" class="secondary">Backup Selected</button>
-                <button id="migrateSelectedBtn" class="secondary">Migrate Selected</button>
+                <button id="backupSelectedBtn" class="secondary">Backup Selected<span class="count-badge" id="backupCount">0</span></button>
+                <button id="migrateSelectedBtn" class="secondary">Migrate Selected<span class="count-badge" id="migrateCount">0</span></button>
               </div>
-              <div class="action-group">
-                <button id="deleteSelectedBtn" class="secondary">Delete Selected</button>
+              <div class="action-group" data-context="unattached">
+                <button id="deleteSelectedBtn" class="secondary">Delete Selected<span class="count-badge" id="deleteCount">0</span></button>
               </div>
             </div>
           </div>
           <div id="notice" class="notice"></div>
+          <div id="opLog" class="op-log" hidden>
+            <div class="op-log-header">
+              <strong>Activity log</strong>
+              <button id="opLogClose" type="button" class="link-btn">Hide</button>
+            </div>
+            <ol id="opLogList"></ol>
+          </div>
           <div class="summary" id="summary" hidden>
             <div class="card"><div class="label">Total Disks</div><div class="value" id="totalDisks">0</div></div>
             <div class="card warn"><div class="label">V1 Disks</div><div class="value" id="v1Disks">0</div></div>
             <div class="card accent"><div class="label">V2 Disks</div><div class="value" id="v2Disks">0</div></div>
-            <div class="card"><div class="label">Eligible To Migrate</div><div class="value" id="eligibleDisks">0</div></div>
+            <div class="card"><div class="label">V2 Ready (green)</div><div class="value" id="eligibleDisks">0</div></div>
             <div class="card danger"><div class="label">Unattached Disks</div><div class="value" id="unattachedDisks">0</div></div>
           </div>
           <div id="meta" class="meta"></div>
         </section>
 
-        <section class="view-stack" id="content" hidden>
-          <div id="viewAll" class="view active">
+        <section class="view-stack" id="content">
+          <div id="viewDocs" class="view active">
+            <div class="panel docs">
+              <div class="docs-header">
+                <div>
+                  <h2>About this dashboard</h2>
+                  <p class="docs-tagline">A reference for what this tool does, how to navigate it, and how to act on its findings.</p>
+                </div>
+              </div>
+              <div class="docs-grid">
+                <article class="docs-section">
+                  <h3>What it is</h3>
+                  <p>An interactive dashboard over the Azure CLI for inspecting managed disks across a subscription, evaluating their readiness for migration from <strong>Premium SSD v1</strong> (<code>Premium_LRS</code>) to <strong>Premium SSD v2</strong> (<code>PremiumV2_LRS</code>), creating snapshot backups, and cleaning up unattached disks &mdash; all from one page.</p>
+                  <p>The server is a single Python file (<code>dashboard/app.py</code>) that shells out to <code>az</code>. Nothing is stored persistently; results are cached in memory for 60 seconds (inventory) and 1 hour (region support).</p>
+                </article>
+
+                <article class="docs-section">
+                  <h3>Quick start</h3>
+                  <ol>
+                    <li>Install Azure CLI and run <code>az login</code>.</li>
+                    <li>Start the server: <code>python dashboard/app.py</code></li>
+                    <li>Open <code>http://127.0.0.1:8765</code>.</li>
+                    <li>Pick a subscription, optionally type a resource group filter, and click <strong>Load Disks</strong>.</li>
+                    <li>Switch tabs in the sidebar to inspect each view.</li>
+                  </ol>
+                </article>
+
+                <article class="docs-section">
+                  <h3>Three data views</h3>
+                  <ul>
+                    <li><strong>All Disks</strong> &mdash; full inventory with version, SKU, attachment, OS-disk flag, caching, region.</li>
+                    <li><strong>Premium LRS Data Disks</strong> &mdash; only Premium_LRS data disks, with V2-readiness flags (a&ndash;f) and a colored status.</li>
+                    <li><strong>Unattached Disks</strong> &mdash; selection-driven cleanup workflow.</li>
+                  </ul>
+                </article>
+
+                <article class="docs-section">
+                  <h3>Actions</h3>
+                  <ul>
+                    <li><strong>Load Disks</strong> &mdash; queries Azure for VMs, disks, and PremiumV2 region support.</li>
+                    <li><strong>Export CSV</strong> &mdash; downloads the full inventory (or selected unattached disks).</li>
+                    <li><strong>Backup Selected</strong> &mdash; creates snapshots for selected green disks without migrating.</li>
+                    <li><strong>Backup Before Migration</strong> &mdash; checkbox; if ticked, snapshot is taken before SKU change.</li>
+                    <li><strong>Migrate Selected</strong> &mdash; deallocates the VM (if attached), runs <code>az disk update --sku PremiumV2_LRS</code>, and starts the VM.</li>
+                    <li><strong>Delete Selected</strong> &mdash; deletes selected unattached disks after a confirm prompt.</li>
+                  </ul>
+                </article>
+
+                <article class="docs-section">
+                  <h3>Status colors</h3>
+                  <div class="legend-row"><span class="pill status-green">Green</span> Region supports v2 and no blockers &mdash; ready for direct conversion.</div>
+                  <div class="legend-row"><span class="pill status-yellow">Yellow</span> Region supports v2, but at least one workaround is needed.</div>
+                  <div class="legend-row"><span class="pill status-red">Red</span> Region does not advertise PremiumV2_LRS; v2 not possible there.</div>
+                  <p>Only <strong>green</strong> disks are selectable for migration. Yellow disks need the listed workaround applied first; red disks need to be moved to a supported region.</p>
+                </article>
+
+                <article class="docs-section">
+                  <h3>Productivity</h3>
+                  <ul>
+                    <li><strong>Search box</strong> per table filters rows by any visible text (disk name, RG, VM, SKU, status&hellip;).</li>
+                    <li><strong>Selection counts</strong> on action buttons; buttons disable when nothing is selected.</li>
+                    <li><strong>Activity log</strong> &mdash; live-updating panel below the action bar; ✓ for completed steps, ✗ for errors.</li>
+                    <li><strong>Contextual buttons</strong> &mdash; only the actions relevant to the active tab are shown.</li>
+                    <li><strong>Caching</strong> &mdash; inventory 60s, region support 1h; click <strong>Load Disks</strong> again to force a refresh.</li>
+                  </ul>
+                </article>
+              </div>
+
+              <div class="docs-section docs-flags">
+                <h3>Eligibility flags (a&ndash;f)</h3>
+                <div style="overflow:auto;">
+                  <table class="flag-table">
+                    <thead>
+                      <tr>
+                        <th>Flag</th>
+                        <th>What it checks</th>
+                        <th>True means</th>
+                        <th>Workaround if blocked</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr>
+                        <td>a. Region Supported</td>
+                        <td>Whether <code>PremiumV2_LRS</code> is available in the disk's region (per <code>az vm list-skus</code>).</td>
+                        <td><span class="flag-good">Good</span> &mdash; region supports v2.</td>
+                        <td>Move workload to a v2-enabled region.</td>
+                      </tr>
+                      <tr>
+                        <td>b. Sector &ne; 512</td>
+                        <td>Disk's logical sector size. v2 in-place conversion requires 512.</td>
+                        <td><span class="flag-bad">Issue</span> &mdash; disk uses 4096-byte sectors.</td>
+                        <td>Snapshot &rarr; create new V2 disk with sector 512 &rarr; swap.</td>
+                      </tr>
+                      <tr>
+                        <td>c. Host Caching On</td>
+                        <td>Whether the VM-side caching for this disk is ReadOnly or ReadWrite.</td>
+                        <td><span class="flag-bad">Issue</span> &mdash; caching is enabled.</td>
+                        <td>Set caching to <code>None</code> on the VM's disk attachment.</td>
+                      </tr>
+                      <tr>
+                        <td>d. Bursting On</td>
+                        <td>On-demand bursting (<code>burstingEnabled = true</code>) on the disk.</td>
+                        <td><span class="flag-bad">Issue</span> &mdash; bursting is enabled.</td>
+                        <td>Disable bursting before converting.</td>
+                      </tr>
+                      <tr>
+                        <td>e. Double Encryption On</td>
+                        <td>Disk uses <code>EncryptionAtRestWithPlatformAndCustomerKeys</code>.</td>
+                        <td><span class="flag-bad">Issue</span> &mdash; double encryption enabled.</td>
+                        <td>Re-key with a single-key DES, or recreate from snapshot.</td>
+                      </tr>
+                      <tr>
+                        <td>f. ASR Enabled</td>
+                        <td>Heuristic match on disk tags or name suggesting Azure Site Recovery replication.</td>
+                        <td><span class="flag-bad">Issue</span> &mdash; ASR appears active.</td>
+                        <td>Disable ASR replication for the disk before converting.</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div class="docs-grid">
+                <article class="docs-section">
+                  <h3>Caveats</h3>
+                  <ul>
+                    <li><strong>Zonal requirement.</strong> In-place <code>Premium_LRS &rarr; PremiumV2_LRS</code> works only when the source disk is zonal. Regional disks need snapshot &amp; recreate.</li>
+                    <li><strong>ASR detection is heuristic.</strong> The dashboard scans tags and disk names for ASR markers. Authoritative ASR state requires a Recovery Services Vault query.</li>
+                    <li><strong>Sector size returned as null.</strong> <code>az disk list</code> often omits <code>logicalSectorSize</code>; the dashboard treats null as 512 (the default).</li>
+                    <li><strong>OS disks excluded.</strong> The Premium LRS Data Disks view filters out OS disks; OS-to-v2 conversion is not supported.</li>
+                    <li><strong>Migrate deallocates the VM.</strong> Attached-disk migration deallocates the VM, updates the SKU, and restarts the VM. Plan downtime.</li>
+                  </ul>
+                </article>
+
+                <article class="docs-section">
+                  <h3>Permissions</h3>
+                  <p>The dashboard uses your Azure CLI login. Roles needed:</p>
+                  <ul>
+                    <li><strong>Reader</strong> on the subscription &mdash; to load inventory.</li>
+                    <li><strong>Disk Contributor</strong> &mdash; for snapshot / migrate / delete.</li>
+                    <li><strong>Virtual Machine Contributor</strong> &mdash; for the VM deallocate / start during attached-disk migration.</li>
+                  </ul>
+                </article>
+
+                <article class="docs-section">
+                  <h3>Tips</h3>
+                  <ul>
+                    <li>Tick <strong>Backup Before Migration</strong> for a safety snapshot &mdash; rollback is just an <code>az disk create --source &lt;snapshot&gt;</code>.</li>
+                    <li>If a load takes a while, <code>az vm list-skus</code> is the slow part; it caches for an hour after first success.</li>
+                    <li>Use the search box to type a disk name when working in subscriptions with thousands of disks.</li>
+                  </ul>
+                </article>
+              </div>
+            </div>
+          </div>
+
+          <div id="viewAll" class="view">
             <div class="panel">
               <h2>All Disks</h2>
+              <div class="table-toolbar">
+                <input id="searchInventory" type="search" placeholder="Filter by disk, RG, VM, region, SKU...">
+                <span class="row-count" id="inventoryRowCount"></span>
+              </div>
               <div class="table-wrap"><table id="inventoryTable"></table></div>
             </div>
           </div>
 
           <div id="viewEligible" class="view">
             <div class="panel">
-              <h2>Eligible For Migration</h2>
+              <h2>Premium SSD LRS Data Disks</h2>
+              <div class="legend">
+                <span><span class="pill status-green">Green</span> Region supported &amp; no blockers</span>
+                <span><span class="pill status-yellow">Yellow</span> Region supported, workarounds needed</span>
+                <span><span class="pill status-red">Red</span> Region does not support Premium SSD v2</span>
+              </div>
+              <div class="table-toolbar">
+                <input id="searchEligible" type="search" placeholder="Filter by disk, RG, VM, region, status...">
+                <span class="row-count" id="eligibleRowCount"></span>
+              </div>
               <div id="migrationMeta" class="meta"></div>
               <div class="table-wrap"><table id="eligibleTable"></table></div>
-            </div>
-            <div class="panel">
-              <h2>Skipped For Migration</h2>
-              <div class="table-wrap"><table id="skippedTable"></table></div>
             </div>
           </div>
 
           <div id="viewUnattached" class="view">
             <div class="panel">
               <h2>Unattached Disks</h2>
+              <div class="table-toolbar">
+                <input id="searchUnattached" type="search" placeholder="Filter by disk, RG, region, SKU...">
+                <span class="row-count" id="unattachedRowCount"></span>
+              </div>
               <div id="unattachedMeta" class="meta"></div>
               <div class="table-wrap"><table id="unattachedTable"></table></div>
             </div>
@@ -450,12 +1022,18 @@ HTML = """<!doctype html>
         <div class="footer-note">
           <div class="footer-copy">
             Author: <strong>Vikram Vunduru</strong><br>
-            For support, reach out on LinkedIn.
+            More work at <a href="https://www.vikramvunduru.com" target="_blank" rel="noopener noreferrer">vikramvunduru.com</a>. For support, email <a href="mailto:vikram.vunduru@gmail.com">vikram.vunduru@gmail.com</a>.
           </div>
-          <a class="linkedin-btn" href="https://www.linkedin.com/in/vikram-vunduru/" target="_blank" rel="noopener noreferrer">
-            <span aria-hidden="true">in</span>
-            <span>LinkedIn</span>
-          </a>
+          <div class="footer-links">
+            <a class="website-btn" href="https://www.vikramvunduru.com" target="_blank" rel="noopener noreferrer">
+              <span aria-hidden="true">&#x25C6;</span>
+              <span>Portfolio</span>
+            </a>
+            <a class="email-btn" href="mailto:vikram.vunduru@gmail.com">
+              <span aria-hidden="true">&#x2709;</span>
+              <span>Email</span>
+            </a>
+          </div>
         </div>
       </section>
     </div>
@@ -476,15 +1054,18 @@ HTML = """<!doctype html>
     const unattachedMetaEl = document.getElementById("unattachedMeta");
     const migrationMetaEl = document.getElementById("migrationMeta");
     const navButtons = {
+      docs: document.getElementById("navDocs"),
       all: document.getElementById("navAll"),
       eligible: document.getElementById("navEligible"),
       unattached: document.getElementById("navUnattached")
     };
     const viewPanels = {
+      docs: document.getElementById("viewDocs"),
       all: document.getElementById("viewAll"),
       eligible: document.getElementById("viewEligible"),
       unattached: document.getElementById("viewUnattached")
     };
+    const controlsPanelEl = document.getElementById("controlsPanel");
 
     function showNotice(message, isError = false) {
       noticeEl.textContent = message;
@@ -515,9 +1096,60 @@ HTML = """<!doctype html>
       });
       const data = await response.json();
       if (!response.ok) {
-        throw new Error(data.error || "Request failed");
+        const err = new Error(data.error || "Request failed");
+        err.log = data.log || [];
+        throw err;
       }
       return data;
+    }
+
+    const opLogEl = document.getElementById("opLog");
+    const opLogListEl = document.getElementById("opLogList");
+    document.getElementById("opLogClose").addEventListener("click", () => { opLogEl.hidden = true; });
+
+    function renderOpLog(entries) {
+      if (!entries || entries.length === 0) {
+        opLogEl.hidden = true;
+        opLogListEl.innerHTML = "";
+        return;
+      }
+      const completionPatterns = [/^Done\b/i, /^Migrated /, /^Snapshot .* created/i, /^Deleted /, /^VM .* (deallocated|started)/i, /complete/i];
+      opLogListEl.innerHTML = entries.map(entry => {
+        const text = entry.message || "";
+        const isError = text.startsWith("ERROR");
+        const isDone  = !isError && completionPatterns.some(rx => rx.test(text));
+        const liCls   = isError ? "err" : (isDone ? "done" : "");
+        const txtCls  = isError ? "err" : "";
+        const safe    = text.replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+        return `<li class="${liCls}"><span class="ts">${entry.ts || ""}</span><span class="${txtCls}">${safe}</span></li>`;
+      }).join("");
+      opLogEl.hidden = false;
+      opLogEl.scrollTop = opLogEl.scrollHeight;
+    }
+
+    async function pollOperation(opId) {
+      while (true) {
+        const status = await fetchJson(`/api/op-status/${opId}`);
+        renderOpLog(status.log);
+        if (status.status === "complete") {
+          return { ok: true, result: status.result, log: status.log };
+        }
+        if (status.status === "failed") {
+          return { ok: false, error: status.error, log: status.log };
+        }
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+
+    async function withBusy(button, fn) {
+      const wasDisabled = button.disabled;
+      button.setAttribute("aria-busy", "true");
+      button.disabled = true;
+      try { return await fn(); }
+      finally {
+        button.removeAttribute("aria-busy");
+        button.disabled = wasDisabled;
+      }
     }
 
     function subscriptionLabel(subscription) {
@@ -546,6 +1178,38 @@ HTML = """<!doctype html>
       return `<span class="pill ${kind}">${value}</span>`;
     }
 
+    function flagIcon(value) {
+      if (value === null || value === undefined) {
+        return `<span class="icon-cell icon-na" title="Unknown">?</span>`;
+      }
+      if (value === true) {
+        return `<span class="icon-cell icon-yes" title="Yes">✓</span>`;
+      }
+      return `<span class="icon-cell icon-no" title="No">✗</span>`;
+    }
+
+    // For "issue" flags (b-f): TRUE means problem (red), FALSE means clean (green)
+    function issueIcon(value) {
+      if (value === null || value === undefined) {
+        return `<span class="icon-cell icon-na" title="Unknown">?</span>`;
+      }
+      if (value === true) {
+        return `<span class="icon-cell icon-no" title="Yes (issue)">⚠</span>`;
+      }
+      return `<span class="icon-cell icon-yes" title="No">✓</span>`;
+    }
+
+    // For positive flags (a Region Supported): TRUE = green
+    function positiveIcon(value) {
+      if (value === null || value === undefined) {
+        return `<span class="icon-cell icon-na" title="Unknown">?</span>`;
+      }
+      if (value === true) {
+        return `<span class="icon-cell icon-yes" title="Supported">✓</span>`;
+      }
+      return `<span class="icon-cell icon-no" title="Not supported">✗</span>`;
+    }
+
     function portalLink(url, label = "Open") {
       if (!url) {
         return "";
@@ -560,6 +1224,55 @@ HTML = """<!doctype html>
       for (const [key, panel] of Object.entries(viewPanels)) {
         panel.classList.toggle("active", key === viewName);
       }
+      controlsPanelEl.hidden = viewName === "docs";
+      const showByContext = { docs: [], all: ["all"], eligible: ["all","eligible"], unattached: ["all","unattached"] };
+      const allowed = new Set(showByContext[viewName] || ["all"]);
+      for (const group of document.querySelectorAll(".action-group")) {
+        const ctx = group.dataset.context || "all";
+        group.classList.toggle("context-hidden", !allowed.has(ctx));
+      }
+    }
+
+    function updateSelectionCounts() {
+      const migrate = state.selectedMigrationDiskIds.size;
+      const unattached = state.selectedUnattachedDiskIds.size;
+      document.getElementById("backupCount").textContent = migrate;
+      document.getElementById("migrateCount").textContent = migrate;
+      document.getElementById("deleteCount").textContent = unattached;
+      document.getElementById("backupSelectedBtn").disabled = migrate === 0;
+      document.getElementById("migrateSelectedBtn").disabled = migrate === 0;
+      document.getElementById("deleteSelectedBtn").disabled = unattached === 0;
+    }
+
+    function applyTableFilter(tableId, query) {
+      const table = document.getElementById(tableId);
+      if (!table) return 0;
+      const tbody = table.querySelector("tbody");
+      if (!tbody) return 0;
+      const q = (query || "").trim().toLowerCase();
+      let visible = 0;
+      for (const row of tbody.rows) {
+        const text = row.textContent.toLowerCase();
+        const match = !q || text.includes(q);
+        row.style.display = match ? "" : "none";
+        if (match) visible++;
+      }
+      return visible;
+    }
+
+    function refreshAllFilters() {
+      const inv = document.getElementById("searchInventory");
+      const elig = document.getElementById("searchEligible");
+      const una = document.getElementById("searchUnattached");
+      const invCount = applyTableFilter("inventoryTable", inv.value);
+      const eligCount = applyTableFilter("eligibleTable", elig.value);
+      const unaCount = applyTableFilter("unattachedTable", una.value);
+      const invTotal = state.data ? state.data.inventory.length : 0;
+      const eligTotal = state.data ? (state.data.premiumLrsDataDisks || []).length : 0;
+      const unaTotal = state.data ? state.data.unattached.length : 0;
+      document.getElementById("inventoryRowCount").textContent = `${invCount} of ${invTotal} disks`;
+      document.getElementById("eligibleRowCount").textContent = `${eligCount} of ${eligTotal} disks`;
+      document.getElementById("unattachedRowCount").textContent = `${unaCount} of ${unaTotal} disks`;
     }
 
     function renderTable(elementId, columns, rows, formatter = null) {
@@ -580,7 +1293,7 @@ HTML = """<!doctype html>
     function renderData(data) {
       state.data = data;
       const availableUnattachedIds = new Set((data.unattached || []).map(item => item.id));
-      const availableMigrationIds = new Set((data.migrationPlan || []).filter(item => item.eligible).map(item => item.id));
+      const availableMigrationIds = new Set((data.premiumLrsDataDisks || []).filter(item => item.status === "green").map(item => item.id));
       state.selectedUnattachedDiskIds = new Set(
         [...state.selectedUnattachedDiskIds].filter(id => availableUnattachedIds.has(id))
       );
@@ -628,22 +1341,43 @@ HTML = """<!doctype html>
         }
       );
 
+      const premiumLrsRows = data.premiumLrsDataDisks || [];
       renderTable(
         "eligibleTable",
         [
           { key: "select", label: "Select" },
+          { key: "status", label: "Status" },
           { key: "resourceGroup", label: "Resource Group" },
           { key: "vmName", label: "VM" },
           { key: "diskName", label: "Disk" },
-          { key: "plannedSku", label: "Planned SKU" },
-          { key: "reasons", label: "Notes" },
+          { key: "location", label: "Region" },
+          { key: "regionSupported", label: "a. Region Supported" },
+          { key: "sectorNot512", label: "b. Sector ≠ 512" },
+          { key: "hostCachingEnabled", label: "c. Host Caching On" },
+          { key: "burstingEnabled", label: "d. Bursting On" },
+          { key: "doubleEncryptionEnabled", label: "e. Double Encryption On" },
+          { key: "asrEnabled", label: "f. ASR Enabled" },
+          { key: "notes", label: "Notes" },
           { key: "portalUrl", label: "Portal" }
         ],
-        data.migrationPlan.filter(item => item.eligible),
+        premiumLrsRows,
         (key, value, row) => {
           if (key === "select") {
+            if (row.status !== "green") {
+              return "";
+            }
             const checked = state.selectedMigrationDiskIds.has(row.id) ? "checked" : "";
             return `<input type="checkbox" class="migration-select" data-disk-id="${row.id}" ${checked}>`;
+          }
+          if (key === "status") {
+            const label = row.status === "green" ? "Green" : row.status === "yellow" ? "Yellow" : "Red";
+            return pill(label, `status-${row.status}`);
+          }
+          if (key === "regionSupported") {
+            return positiveIcon(value);
+          }
+          if (["sectorNot512","hostCachingEnabled","burstingEnabled","doubleEncryptionEnabled","asrEnabled"].includes(key)) {
+            return issueIcon(value);
           }
           if (key === "portalUrl") {
             return portalLink(value);
@@ -651,21 +1385,11 @@ HTML = """<!doctype html>
           return value ?? "";
         }
       );
-      migrationMetaEl.textContent = `${state.selectedMigrationDiskIds.size} of ${data.migrationPlan.filter(item => item.eligible).length} migration disks selected`;
+      const greenCount = premiumLrsRows.filter(item => item.status === "green").length;
+      const yellowCount = premiumLrsRows.filter(item => item.status === "yellow").length;
+      const redCount = premiumLrsRows.filter(item => item.status === "red").length;
+      migrationMetaEl.textContent = `${state.selectedMigrationDiskIds.size} of ${greenCount} green disks selected | Green: ${greenCount} | Yellow: ${yellowCount} | Red: ${redCount} | Total Premium LRS data disks: ${premiumLrsRows.length}`;
       bindMigrationSelectionHandlers();
-
-      renderTable(
-        "skippedTable",
-        [
-          { key: "resourceGroup", label: "Resource Group" },
-          { key: "vmName", label: "VM" },
-          { key: "diskName", label: "Disk" },
-          { key: "reasons", label: "Reason" },
-          { key: "portalUrl", label: "Portal" }
-        ],
-        data.migrationPlan.filter(item => !item.eligible),
-        (key, value) => key === "portalUrl" ? portalLink(value) : (value ?? "")
-      );
 
       renderTable(
         "unattachedTable",
@@ -692,6 +1416,8 @@ HTML = """<!doctype html>
       );
       unattachedMetaEl.textContent = `${state.selectedUnattachedDiskIds.size} of ${data.unattached.length} unattached disks selected`;
       bindUnattachedSelectionHandlers();
+      updateSelectionCounts();
+      refreshAllFilters();
     }
 
     function downloadBlob(content, filename, mimeType) {
@@ -723,7 +1449,8 @@ HTML = """<!doctype html>
       if (!state.data) {
         return [];
       }
-      return state.data.migrationPlan.filter(row => row.eligible && state.selectedMigrationDiskIds.has(row.id));
+      const source = state.data.premiumLrsDataDisks || [];
+      return source.filter(row => row.status === "green" && state.selectedMigrationDiskIds.has(row.id));
     }
 
     function exportInventoryCsv() {
@@ -752,6 +1479,7 @@ HTML = """<!doctype html>
             state.selectedUnattachedDiskIds.delete(diskId);
           }
           unattachedMetaEl.textContent = `${state.selectedUnattachedDiskIds.size} of ${state.data.unattached.length} unattached disks selected`;
+          updateSelectionCounts();
         });
       }
     }
@@ -765,7 +1493,12 @@ HTML = """<!doctype html>
           } else {
             state.selectedMigrationDiskIds.delete(diskId);
           }
-          migrationMetaEl.textContent = `${state.selectedMigrationDiskIds.size} of ${state.data.migrationPlan.filter(item => item.eligible).length} migration disks selected`;
+          const source = state.data.premiumLrsDataDisks || [];
+          const greenCount = source.filter(item => item.status === "green").length;
+          const yellowCount = source.filter(item => item.status === "yellow").length;
+          const redCount = source.filter(item => item.status === "red").length;
+          migrationMetaEl.textContent = `${state.selectedMigrationDiskIds.size} of ${greenCount} green disks selected | Green: ${greenCount} | Yellow: ${yellowCount} | Red: ${redCount} | Total Premium LRS data disks: ${source.length}`;
+          updateSelectionCounts();
         });
       }
     }
@@ -789,7 +1522,8 @@ HTML = """<!doctype html>
 
       try {
         showNotice("Deleting selected unattached disks...");
-        const result = await postJson("/api/delete-unattached", {
+        renderOpLog([]);
+        const { opId } = await postJson("/api/delete-unattached", {
           subscriptionId: state.data.subscriptionId,
           disks: rows.map(row => ({
             resourceGroup: row.resourceGroup,
@@ -797,9 +1531,14 @@ HTML = """<!doctype html>
             id: row.id
           }))
         });
-        state.selectedUnattachedDiskIds = new Set();
-        await loadInventory();
-        showNotice(`Deleted ${result.deletedCount} unattached disk(s).`);
+        const outcome = await pollOperation(opId);
+        if (outcome.ok) {
+          state.selectedUnattachedDiskIds = new Set();
+          await loadInventory();
+          showNotice(`Deleted ${outcome.result.deletedCount} unattached disk(s).`);
+        } else {
+          showNotice(outcome.error, true);
+        }
       } catch (error) {
         showNotice(error.message, true);
       }
@@ -817,11 +1556,17 @@ HTML = """<!doctype html>
       }
       try {
         showNotice("Creating snapshots for selected disks...");
-        const result = await postJson("/api/backup-disks", {
+        renderOpLog([]);
+        const { opId } = await postJson("/api/backup-disks", {
           subscriptionId: state.data.subscriptionId,
           disks: rows.map(row => ({ id: row.id, resourceGroup: row.resourceGroup, diskName: row.diskName }))
         });
-        showNotice(`Created ${result.snapshotCount} snapshot(s).`);
+        const outcome = await pollOperation(opId);
+        if (outcome.ok) {
+          showNotice(`Created ${outcome.result.snapshotCount} snapshot(s).`);
+        } else {
+          showNotice(outcome.error, true);
+        }
       } catch (error) {
         showNotice(error.message, true);
       }
@@ -844,14 +1589,20 @@ HTML = """<!doctype html>
       }
       try {
         showNotice("Migrating selected disks...");
-        const result = await postJson("/api/migrate-disks", {
+        renderOpLog([]);
+        const { opId } = await postJson("/api/migrate-disks", {
           subscriptionId: state.data.subscriptionId,
           createBackupBefore,
           disks: rows.map(row => ({ id: row.id, resourceGroup: row.resourceGroup, diskName: row.diskName }))
         });
-        state.selectedMigrationDiskIds = new Set();
-        await loadInventory();
-        showNotice(`Migrated ${result.migratedCount} disk(s) to PremiumV2_LRS.${result.snapshotCount ? ` Created ${result.snapshotCount} snapshot(s).` : ""}`);
+        const outcome = await pollOperation(opId);
+        if (outcome.ok) {
+          state.selectedMigrationDiskIds = new Set();
+          await loadInventory();
+          showNotice(`Migrated ${outcome.result.migratedCount} disk(s) to PremiumV2_LRS.${outcome.result.snapshotCount ? ` Created ${outcome.result.snapshotCount} snapshot(s).` : ""}`);
+        } else {
+          showNotice(outcome.error, true);
+        }
       } catch (error) {
         showNotice(error.message, true);
       }
@@ -882,14 +1633,22 @@ HTML = """<!doctype html>
       }
     }
 
-    document.getElementById("loadBtn").addEventListener("click", loadInventory);
+    document.getElementById("loadBtn").addEventListener("click", (ev) => withBusy(ev.currentTarget, loadInventory));
     document.getElementById("csvBtn").addEventListener("click", exportInventoryCsv);
-    document.getElementById("backupSelectedBtn").addEventListener("click", backupSelectedMigration);
-    document.getElementById("migrateSelectedBtn").addEventListener("click", migrateSelectedDisks);
-    document.getElementById("deleteSelectedBtn").addEventListener("click", deleteSelectedUnattached);
+    document.getElementById("backupSelectedBtn").addEventListener("click", (ev) => withBusy(ev.currentTarget, backupSelectedMigration));
+    document.getElementById("migrateSelectedBtn").addEventListener("click", (ev) => withBusy(ev.currentTarget, migrateSelectedDisks));
+    document.getElementById("deleteSelectedBtn").addEventListener("click", (ev) => withBusy(ev.currentTarget, deleteSelectedUnattached));
+    navButtons.docs.addEventListener("click", () => setActiveView("docs"));
     navButtons.all.addEventListener("click", () => setActiveView("all"));
     navButtons.eligible.addEventListener("click", () => setActiveView("eligible"));
     navButtons.unattached.addEventListener("click", () => setActiveView("unattached"));
+
+    for (const id of ["searchInventory", "searchEligible", "searchUnattached"]) {
+      document.getElementById(id).addEventListener("input", refreshAllFilters);
+    }
+
+    setActiveView("docs");
+    updateSelectionCounts();
 
     loadSubscriptions();
   </script>
@@ -984,6 +1743,33 @@ def get_disk_version(sku_name):
     return "Other"
 
 
+def get_double_encryption_enabled(disk):
+    encryption = disk.get("encryption") or {}
+    encryption_type = (encryption.get("type") or "").lower()
+    return "platformandcustomerkeys" in encryption_type or "doubleencryption" in encryption_type
+
+
+def get_asr_enabled(disk):
+    tags = disk.get("tags") or {}
+    for key, value in tags.items():
+        haystack = f"{key} {value}".lower()
+        if "asr" in haystack or "siterecovery" in haystack or "recoveryservice" in haystack:
+            return True
+    name = (disk.get("name") or "").lower()
+    if "-asr-" in name or name.endswith("-asr") or "asrseeddisk" in name:
+        return True
+    return False
+
+
+def compute_v2_status(region_supported, sector_not_512, caching_on, bursting_on, double_enc_on, asr_on):
+    if region_supported is False:
+        return "red"
+    issues = [sector_not_512, caching_on, bursting_on, double_enc_on, asr_on]
+    if region_supported is True and not any(issues):
+        return "green"
+    return "yellow"
+
+
 def build_portal_disk_url(disk_id):
     if not disk_id:
         return None
@@ -1012,8 +1798,8 @@ def get_region_support(subscription_id):
         return cached
 
     try:
-        skus = run_az_json(["vm", "list-skus", "--resource-type", "disks"], subscription_id)
-    except RuntimeError:
+        skus = run_az_json(["vm", "list-skus", "--resource-type", "disks"], subscription_id, timeout_seconds=300)
+    except (RuntimeError, subprocess.TimeoutExpired):
         return None
 
     regions = set()
@@ -1116,8 +1902,10 @@ def get_inventory(subscription_id, resource_group_name=None, include_region_supp
                 "isOsDisk": attachment.get("isOsDisk") if attachment else False,
                 "lun": attachment.get("lun") if attachment else None,
                 "caching": attachment.get("caching") if attachment else None,
-                "logicalSectorSize": disk.get("logicalSectorSize"),
+                "logicalSectorSize": disk.get("logicalSectorSize") if disk.get("logicalSectorSize") is not None else 512,
                 "burstingEnabled": disk.get("burstingEnabled"),
+                "doubleEncryptionEnabled": get_double_encryption_enabled(disk),
+                "asrEnabled": get_asr_enabled(disk),
                 "unattached": not attached,
                 "premiumV2RegionSupported": None if supported_regions is None else location in supported_regions,
                 "id": disk.get("id"),
@@ -1126,6 +1914,62 @@ def get_inventory(subscription_id, resource_group_name=None, include_region_supp
         )
 
     return inventory, requires_region_check
+
+
+def build_premium_lrs_data_view(inventory):
+    rows = []
+    for disk in inventory:
+        if disk["sku"] != "Premium_LRS":
+            continue
+        if disk["isOsDisk"]:
+            continue
+
+        region_supported = disk["premiumV2RegionSupported"]
+        sector_not_512 = disk["logicalSectorSize"] != 512
+        caching_on = bool(disk["caching"]) and disk["caching"] != "None"
+        bursting_on = disk["burstingEnabled"] is True
+        double_enc_on = bool(disk["doubleEncryptionEnabled"])
+        asr_on = bool(disk["asrEnabled"])
+
+        status = compute_v2_status(region_supported, sector_not_512, caching_on, bursting_on, double_enc_on, asr_on)
+
+        workarounds = []
+        if sector_not_512:
+            workarounds.append(f"Sector size '{disk['logicalSectorSize']}' is not 512 — workaround: create new V2 disk")
+        if caching_on:
+            workarounds.append(f"Host caching '{disk['caching']}' must be disabled")
+        if bursting_on:
+            workarounds.append("Bursting must be disabled")
+        if double_enc_on:
+            workarounds.append("Double encryption must be disabled")
+        if asr_on:
+            workarounds.append("ASR must be disabled before changing to V2")
+        if region_supported is False:
+            workarounds.insert(0, f"Region '{disk['location']}' does not support Premium SSD v2")
+        elif region_supported is None:
+            workarounds.append("Region support could not be verified from Azure CLI")
+
+        rows.append(
+            {
+                "id": disk["id"],
+                "resourceGroup": disk["resourceGroup"],
+                "vmName": disk["vmName"],
+                "diskName": disk["diskName"],
+                "location": disk["location"],
+                "regionSupported": region_supported,
+                "sectorNot512": sector_not_512,
+                "logicalSectorSize": disk["logicalSectorSize"],
+                "hostCachingEnabled": caching_on,
+                "caching": disk["caching"],
+                "burstingEnabled": bursting_on,
+                "doubleEncryptionEnabled": double_enc_on,
+                "asrEnabled": asr_on,
+                "status": status,
+                "notes": "; ".join(workarounds) if workarounds else "Ready for direct conversion",
+                "portalUrl": disk["portalUrl"],
+            }
+        )
+    return rows
 
 
 def get_migration_plan(inventory):
@@ -1183,15 +2027,20 @@ def build_payload(subscription_id, resource_group_name=None):
         return payload
 
     started_at = time.perf_counter()
-    inventory, region_support_checked = get_inventory(subscription_id, resource_group_name, include_region_support=False)
+    inventory, region_support_checked = get_inventory(subscription_id, resource_group_name, include_region_support=True)
     migration_plan = get_migration_plan(inventory)
+    premium_lrs_data_disks = build_premium_lrs_data_view(inventory)
     unattached = [item for item in inventory if item["unattached"]]
     summary = {
         "totalDisks": len(inventory),
         "v1Disks": sum(1 for item in inventory if item["diskVersion"] == "V1"),
         "v2Disks": sum(1 for item in inventory if item["diskVersion"] == "V2"),
         "otherDisks": sum(1 for item in inventory if item["diskVersion"] == "Other"),
-        "eligibleDisks": sum(1 for item in migration_plan if item["eligible"]),
+        "eligibleDisks": sum(1 for item in premium_lrs_data_disks if item["status"] == "green"),
+        "premiumLrsDataDisks": len(premium_lrs_data_disks),
+        "premiumLrsGreen": sum(1 for item in premium_lrs_data_disks if item["status"] == "green"),
+        "premiumLrsYellow": sum(1 for item in premium_lrs_data_disks if item["status"] == "yellow"),
+        "premiumLrsRed": sum(1 for item in premium_lrs_data_disks if item["status"] == "red"),
         "unattachedDisks": len(unattached),
     }
 
@@ -1202,6 +2051,7 @@ def build_payload(subscription_id, resource_group_name=None):
         "summary": summary,
         "inventory": inventory,
         "migrationPlan": migration_plan,
+        "premiumLrsDataDisks": premium_lrs_data_disks,
         "unattached": unattached,
         "durationMs": int((time.perf_counter() - started_at) * 1000),
         "cacheHit": False,
@@ -1211,8 +2061,68 @@ def build_payload(subscription_id, resource_group_name=None):
     return payload
 
 
-def delete_unattached_disks(subscription_id, disks):
+def _log(log, message):
+    if log is None:
+        return
+    log.append({
+        "ts": datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S"),
+        "message": message,
+    })
+
+
+def _start_operation(target, args):
+    op_id = secrets.token_hex(8)
+    op = {
+        "id": op_id,
+        "status": "running",
+        "log": [],
+        "result": None,
+        "error": None,
+        "createdAt": time.time(),
+    }
+    with _operations_lock:
+        _prune_old_operations_locked()
+        _operations[op_id] = op
+
+    def runner():
+        try:
+            result = target(*args, op["log"])
+            op["result"] = result
+            op["status"] = "complete"
+        except Exception as exc:
+            _log(op["log"], f"ERROR: {exc}")
+            op["error"] = str(exc)
+            op["status"] = "failed"
+
+    threading.Thread(target=runner, daemon=True).start()
+    return op_id
+
+
+def _prune_old_operations_locked():
+    cutoff = time.time() - OPERATION_RETENTION_SECONDS
+    for key in list(_operations.keys()):
+        op = _operations[key]
+        if op["status"] != "running" and op["createdAt"] < cutoff:
+            del _operations[key]
+
+
+def _get_operation_status(op_id):
+    with _operations_lock:
+        op = _operations.get(op_id)
+        if not op:
+            return None
+        return {
+            "id": op["id"],
+            "status": op["status"],
+            "log": list(op["log"]),
+            "result": op["result"],
+            "error": op["error"],
+        }
+
+
+def delete_unattached_disks(subscription_id, disks, log=None):
     deleted_count = 0
+    _log(log, f"Deleting {len(disks)} unattached disk(s)")
 
     for disk in disks:
         resource_group = disk.get("resourceGroup")
@@ -1220,6 +2130,7 @@ def delete_unattached_disks(subscription_id, disks):
         if not resource_group or not disk_name:
             raise RuntimeError("Each disk must include 'resourceGroup' and 'diskName'.")
 
+        _log(log, f"Verifying '{disk_name}' is unattached")
         current_disk = run_az_json(
             ["disk", "show", "--resource-group", resource_group, "--name", disk_name],
             subscription_id,
@@ -1228,14 +2139,17 @@ def delete_unattached_disks(subscription_id, disks):
         if current_disk.get("managedBy") or current_disk.get("diskState") == "Attached":
             raise RuntimeError(f"Disk '{disk_name}' is attached and cannot be deleted from this action.")
 
+        _log(log, f"Deleting '{disk_name}'")
         run_az_json(
             ["disk", "delete", "--resource-group", resource_group, "--name", disk_name, "--yes"],
             subscription_id,
             timeout_seconds=600,
         )
         deleted_count += 1
+        _log(log, f"Deleted '{disk_name}'")
 
     invalidate_payload_cache(subscription_id)
+    _log(log, f"Done. Deleted {deleted_count} disk(s).")
     return {"deletedCount": deleted_count}
 
 
@@ -1265,9 +2179,11 @@ def create_disk_snapshot(subscription_id, resource_group, disk_name, source_disk
     return snapshot_name
 
 
-def migrate_disks(subscription_id, disks, create_backup_before=False):
+def migrate_disks(subscription_id, disks, create_backup_before=False, log=None):
     migrated_count = 0
     snapshot_count = 0
+    _log(log, f"Starting migration of {len(disks)} disk(s){' with backup' if create_backup_before else ''}")
+    _log(log, "Listing VMs to map attachments")
     vm_cache = run_az_json(["vm", "list"], subscription_id) or []
     vm_disk_map = build_vm_disk_map(vm_cache)
     deallocated_vm_keys = set()
@@ -1277,6 +2193,7 @@ def migrate_disks(subscription_id, disks, create_backup_before=False):
         vm_key = (resource_group.lower(), vm_name.lower())
         if vm_key in deallocated_vm_keys:
             return
+        _log(log, f"Deallocating VM '{vm_name}'")
         run_az_json(
             ["vm", "deallocate", "--resource-group", resource_group, "--name", vm_name],
             subscription_id,
@@ -1284,6 +2201,7 @@ def migrate_disks(subscription_id, disks, create_backup_before=False):
         )
         deallocated_vm_keys.add(vm_key)
         deallocated_vms.append({"resourceGroup": resource_group, "vmName": vm_name})
+        _log(log, f"VM '{vm_name}' deallocated")
 
     try:
         for disk in disks:
@@ -1292,6 +2210,7 @@ def migrate_disks(subscription_id, disks, create_backup_before=False):
             if not resource_group or not disk_name:
                 raise RuntimeError("Each disk must include 'resourceGroup' and 'diskName'.")
 
+            _log(log, f"Inspecting disk '{disk_name}'")
             current_disk = run_az_json(
                 ["disk", "show", "--resource-group", resource_group, "--name", disk_name],
                 subscription_id,
@@ -1302,7 +2221,8 @@ def migrate_disks(subscription_id, disks, create_backup_before=False):
                 raise RuntimeError(f"Disk '{disk_name}' is not Premium_LRS.")
             if current_disk.get("osType"):
                 raise RuntimeError(f"Disk '{disk_name}' appears to be an OS disk and cannot be migrated to Premium SSD v2.")
-            if current_disk.get("logicalSectorSize") != 512:
+            sector_size = current_disk.get("logicalSectorSize")
+            if sector_size is not None and sector_size != 512:
                 raise RuntimeError(f"Disk '{disk_name}' does not have a supported logical sector size for direct conversion.")
             if current_disk.get("burstingEnabled") is True:
                 raise RuntimeError(f"Disk '{disk_name}' has bursting enabled.")
@@ -1314,7 +2234,8 @@ def migrate_disks(subscription_id, disks, create_backup_before=False):
                 raise RuntimeError(f"Disk '{disk_name}' must have host caching set to None before migration.")
 
             if create_backup_before:
-                create_disk_snapshot(
+                _log(log, f"Creating snapshot for '{disk_name}'")
+                snap_name = create_disk_snapshot(
                     subscription_id,
                     resource_group,
                     disk_name,
@@ -1323,41 +2244,50 @@ def migrate_disks(subscription_id, disks, create_backup_before=False):
                     sku_name,
                 )
                 snapshot_count += 1
+                _log(log, f"Snapshot '{snap_name}' created")
 
             if attachment and attachment.get("vmName"):
                 ensure_vm_deallocated(attachment["resourceGroup"], attachment["vmName"])
 
+            _log(log, f"Updating SKU of '{disk_name}' to PremiumV2_LRS")
             run_az_json(
                 ["disk", "update", "--resource-group", resource_group, "--name", disk_name, "--sku", "PremiumV2_LRS"],
                 subscription_id,
                 timeout_seconds=600,
             )
             migrated_count += 1
+            _log(log, f"Migrated '{disk_name}' to PremiumV2_LRS")
     finally:
         for vm_target in deallocated_vms:
+            _log(log, f"Starting VM '{vm_target['vmName']}'")
             run_az_json(
                 ["vm", "start", "--resource-group", vm_target["resourceGroup"], "--name", vm_target["vmName"]],
                 subscription_id,
                 timeout_seconds=900,
             )
+            _log(log, f"VM '{vm_target['vmName']}' started")
 
     invalidate_payload_cache(subscription_id)
+    _log(log, f"Done. Migrated {migrated_count} disk(s); created {snapshot_count} snapshot(s).")
     return {"migratedCount": migrated_count, "snapshotCount": snapshot_count}
 
 
-def backup_disks(subscription_id, disks):
+def backup_disks(subscription_id, disks, log=None):
     snapshot_count = 0
+    _log(log, f"Creating snapshots for {len(disks)} disk(s)")
     for disk in disks:
         resource_group = disk.get("resourceGroup")
         disk_name = disk.get("diskName")
         if not resource_group or not disk_name:
             raise RuntimeError("Each disk must include 'resourceGroup' and 'diskName'.")
 
+        _log(log, f"Inspecting '{disk_name}'")
         current_disk = run_az_json(
             ["disk", "show", "--resource-group", resource_group, "--name", disk_name],
             subscription_id,
         )
-        create_disk_snapshot(
+        _log(log, f"Creating snapshot for '{disk_name}'")
+        snap_name = create_disk_snapshot(
             subscription_id,
             resource_group,
             disk_name,
@@ -1366,7 +2296,9 @@ def backup_disks(subscription_id, disks):
             ((current_disk.get("sku") or {}).get("name")) or "Standard_LRS",
         )
         snapshot_count += 1
+        _log(log, f"Snapshot '{snap_name}' created")
 
+    _log(log, f"Done. Created {snapshot_count} snapshot(s).")
     return {"snapshotCount": snapshot_count}
 
 
@@ -1392,6 +2324,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     return self.write_json({"error": "Missing required query parameter 'subscriptionId'."}, HTTPStatus.BAD_REQUEST)
                 return self.write_json(build_payload(subscription_id, resource_group_name))
 
+            if parsed.path.startswith("/api/op-status/"):
+                op_id = parsed.path.rsplit("/", 1)[-1]
+                status = _get_operation_status(op_id)
+                if status is None:
+                    return self.write_json({"error": "Operation not found"}, HTTPStatus.NOT_FOUND)
+                return self.write_json(status)
+
             self.send_response(HTTPStatus.NOT_FOUND)
             self.end_headers()
         except Exception as error:
@@ -1412,7 +2351,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     return self.write_json({"error": "Missing 'subscriptionId'."}, HTTPStatus.BAD_REQUEST)
                 if not disks:
                     return self.write_json({"error": "No disks were provided for deletion."}, HTTPStatus.BAD_REQUEST)
-                return self.write_json(delete_unattached_disks(subscription_id, disks))
+                op_id = _start_operation(delete_unattached_disks, [subscription_id, disks])
+                return self.write_json({"opId": op_id}, HTTPStatus.ACCEPTED)
 
             if parsed.path == "/api/backup-disks":
                 subscription_id = payload.get("subscriptionId")
@@ -1421,7 +2361,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     return self.write_json({"error": "Missing 'subscriptionId'."}, HTTPStatus.BAD_REQUEST)
                 if not disks:
                     return self.write_json({"error": "No disks were provided for backup."}, HTTPStatus.BAD_REQUEST)
-                return self.write_json(backup_disks(subscription_id, disks))
+                op_id = _start_operation(backup_disks, [subscription_id, disks])
+                return self.write_json({"opId": op_id}, HTTPStatus.ACCEPTED)
 
             if parsed.path == "/api/migrate-disks":
                 subscription_id = payload.get("subscriptionId")
@@ -1431,7 +2372,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     return self.write_json({"error": "Missing 'subscriptionId'."}, HTTPStatus.BAD_REQUEST)
                 if not disks:
                     return self.write_json({"error": "No disks were provided for migration."}, HTTPStatus.BAD_REQUEST)
-                return self.write_json(migrate_disks(subscription_id, disks, create_backup_before))
+                op_id = _start_operation(migrate_disks, [subscription_id, disks, create_backup_before])
+                return self.write_json({"opId": op_id}, HTTPStatus.ACCEPTED)
 
             self.send_response(HTTPStatus.NOT_FOUND)
             self.end_headers()
