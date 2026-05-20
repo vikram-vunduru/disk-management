@@ -140,6 +140,20 @@ Use this view to:
 - other SKUs are shown but not migrated by default
 - Azure can still reject migration based on subscription, VM, encryption, region, or workload constraints not fully detectable in advance
 
+## Disclaimer & limitation of liability
+
+This software is provided **"AS IS"**, without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and non-infringement. The author and contributors shall not be held liable for any claim, damages, or other liability — including but not limited to data loss, service interruption, downtime, or financial impact — arising from, or in connection with, the use of, or inability to use, this software.
+
+By using the **Migrate**, **Backup**, or **Delete** functionality you acknowledge that:
+
+- you have the appropriate authorization to perform these actions on the target Azure resources;
+- you have verified the selected scope and confirmed the impact with the affected workload owners;
+- you have taken independent backups (snapshots, Azure Backup, or equivalent) before initiating destructive operations;
+- the displayed eligibility status is a best-effort evaluation and may not capture every runtime constraint Azure enforces (region capacity, RBAC, ASR replication state, encryption configuration, etc.);
+- migration and deletion actions are **irreversible without prior backups**.
+
+Operators are solely responsible for the consequences of any action initiated through this tool. Before each action the dashboard displays an impact summary and requires the operator to type a confirmation phrase (`MIGRATE` or `DELETE`). Treat that prompt as the last opportunity to verify the change set.
+
 ## Author
 
 Vikram Vunduru  

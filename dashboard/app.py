@@ -31,6 +31,76 @@ _operations = {}
 OPERATION_RETENTION_SECONDS = 3600
 
 
+def _env_bool(name):
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+READ_ONLY_MODE = _env_bool("DISK_DASHBOARD_READONLY")
+DRY_RUN_MODE = _env_bool("DISK_DASHBOARD_DRYRUN")
+AUTH_TOKEN = os.environ.get("DISK_DASHBOARD_TOKEN") or None
+AUDIT_DIR = os.environ.get("DISK_DASHBOARD_AUDIT_DIR") or os.path.join(
+    os.path.expanduser("~"), ".disk-management", "audit"
+)
+try:
+    MAX_MIGRATION_BATCH = max(1, int(os.environ.get("DISK_DASHBOARD_MAX_BATCH") or "25"))
+except ValueError:
+    MAX_MIGRATION_BATCH = 25
+
+# State-changing az subcommand prefixes that a dry-run should never actually execute.
+_STATE_CHANGING_COMMANDS = {
+    ("disk", "create"),
+    ("disk", "update"),
+    ("disk", "delete"),
+    ("snapshot", "create"),
+    ("snapshot", "delete"),
+    ("vm", "deallocate"),
+    ("vm", "start"),
+    ("vm", "update"),
+}
+
+
+_audit_lock = threading.Lock()
+
+
+def write_audit_entry(action, subscription_id, disks, result=None, error=None, dry_run=False):
+    """Append an audit record to today's JSONL file. Audit failures are swallowed
+    so they never block the underlying operation."""
+    try:
+        os.makedirs(AUDIT_DIR, exist_ok=True)
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        path = os.path.join(AUDIT_DIR, f"audit-{date_str}.jsonl")
+        entry = {
+            "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+            "action": action,
+            "subscriptionId": subscription_id,
+            "diskCount": len(disks or []),
+            "disks": [
+                {
+                    "resourceGroup": d.get("resourceGroup"),
+                    "diskName": d.get("diskName"),
+                    "id": d.get("id"),
+                }
+                for d in (disks or [])
+            ],
+            "result": result,
+            "error": error,
+            "dryRun": dry_run,
+        }
+        with _audit_lock:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, default=str) + "\n")
+        return path
+    except Exception:
+        return None
+
+
+def is_state_changing(arguments):
+    """Return True if the first two tokens of an az command modify Azure state."""
+    if not arguments or len(arguments) < 2:
+        return False
+    return (arguments[0], arguments[1]) in _STATE_CHANGING_COMMANDS
+
+
 HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -734,6 +804,128 @@ HTML = """<!doctype html>
     }
     .link-btn:hover { color: #e2e8f0; background: transparent; }
 
+    .mode-banner {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      padding: 8px 16px;
+      font-size: 0.84rem;
+      font-weight: 600;
+      text-align: center;
+      letter-spacing: 0.02em;
+    }
+    .mode-banner.read-only { background: var(--warn-soft); color: var(--warn-ink); border-bottom: 1px solid rgb(245 158 11 / 0.30); }
+    .mode-banner.dry-run   { background: var(--accent-soft); color: var(--accent-strong); border-bottom: 1px solid rgb(99 102 241 / 0.30); }
+
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgb(15 23 42 / 0.55);
+      backdrop-filter: blur(4px);
+      display: grid;
+      place-items: center;
+      z-index: 1000;
+    }
+    .modal-overlay[hidden] { display: none; }
+    .modal {
+      background: var(--paper);
+      border-radius: var(--radius-xl);
+      max-width: 640px;
+      width: calc(100% - 32px);
+      max-height: calc(100vh - 64px);
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 24px 48px -12px rgb(15 23 42 / 0.40);
+      overflow: hidden;
+      border: 1px solid var(--line);
+    }
+    .modal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 18px 22px 12px;
+      border-bottom: 1px solid var(--line);
+    }
+    .modal-header h3 {
+      margin: 0;
+      font-size: 1.05rem;
+      font-weight: 700;
+      color: var(--ink);
+      letter-spacing: -0.015em;
+    }
+    .modal-header.danger h3 { color: var(--danger-ink); }
+    .modal-close {
+      background: transparent;
+      border: none;
+      font-size: 1.3rem;
+      line-height: 1;
+      color: var(--muted);
+      cursor: pointer;
+      padding: 4px 8px;
+      width: auto;
+      min-height: auto;
+      min-width: auto;
+    }
+    .modal-close:hover { color: var(--ink); background: var(--paper-2); }
+    .modal-body {
+      padding: 16px 22px;
+      overflow: auto;
+      font-size: 0.9rem;
+      line-height: 1.55;
+      color: var(--ink-soft);
+    }
+    .modal-body p { margin: 0 0 10px; }
+    .modal-body ul, .modal-body ol { margin: 0 0 10px; padding-left: 22px; }
+    .modal-body li { margin: 3px 0; }
+    .modal-body strong { color: var(--ink); }
+    .modal-impact {
+      background: var(--paper-2);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      padding: 10px 12px;
+      max-height: 180px;
+      overflow: auto;
+      font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace;
+      font-size: 0.78rem;
+      color: var(--ink);
+      margin: 6px 0 12px;
+    }
+    .modal-impact ul { margin: 0; padding-left: 18px; list-style: none; }
+    .modal-impact li { padding: 2px 0; }
+    .modal-impact li::before { content: "→ "; color: var(--muted); }
+    .modal-footer {
+      padding: 14px 22px 18px;
+      border-top: 1px solid var(--line);
+      background: var(--paper-2);
+    }
+    .modal-confirm-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+      font-size: 0.86rem;
+      color: var(--ink-soft);
+    }
+    .modal-confirm-row input {
+      flex: 1;
+      min-height: 36px;
+      font-family: ui-monospace, monospace;
+      letter-spacing: 0.04em;
+    }
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+    .modal-actions button { min-width: 100px; }
+    .modal.danger .modal-actions .primary {
+      background: var(--danger);
+      border-color: var(--danger);
+    }
+    .modal.danger .modal-actions .primary:hover { background: var(--danger-ink); }
+
+    body.disclaimer-pending .workspace { pointer-events: none; opacity: 0.4; }
+
     @media (max-width: 1100px) {
       .layout { grid-template-columns: 1fr; }
       .sidebar { position: static; }
@@ -751,6 +943,28 @@ HTML = """<!doctype html>
   </style>
 </head>
 <body>
+  <div id="modeBanner" class="mode-banner" hidden></div>
+
+  <div id="modalOverlay" class="modal-overlay" hidden>
+    <div class="modal" id="modalEl" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="modal-header" id="modalHeader">
+        <h3 id="modalTitle">Confirm</h3>
+        <button class="modal-close" id="modalCloseBtn" type="button" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body" id="modalBody"></div>
+      <div class="modal-footer">
+        <div class="modal-confirm-row" id="modalConfirmRow" hidden>
+          <label for="modalConfirmInput">Type <strong id="modalConfirmWord">YES</strong> to confirm:</label>
+          <input type="text" id="modalConfirmInput" autocomplete="off" autocapitalize="characters" spellcheck="false">
+        </div>
+        <div class="modal-actions">
+          <button id="modalCancelBtn" class="secondary" type="button">Cancel</button>
+          <button id="modalOkBtn" class="primary" type="button">Confirm</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="shell">
     <header class="hero">
       <div class="hero-brand">
@@ -831,6 +1045,20 @@ HTML = """<!doctype html>
                   <p class="docs-tagline">A reference for what this tool does, how to navigate it, and how to act on its findings.</p>
                 </div>
               </div>
+              <div class="docs-section" style="border-left: 4px solid var(--warn); background: var(--warn-soft); margin-bottom: 16px;">
+                <h3 style="color: var(--warn-ink);">Disclaimer &amp; safe use</h3>
+                <p><strong>This tool is provided "AS IS" without warranty of any kind.</strong> The author and contributors accept no liability for any data loss, service interruption, downtime, or financial impact arising from the use of, or inability to use, this software.</p>
+                <p>By initiating <strong>Migrate</strong>, <strong>Backup</strong>, or <strong>Delete</strong> actions you acknowledge that:</p>
+                <ul>
+                  <li>You have the appropriate authorization to perform these actions on the target Azure resources.</li>
+                  <li>You have verified the selected scope and confirmed the impact with the affected workload owners.</li>
+                  <li>You have taken independent backups (snapshots, Azure Backup, or equivalent) before destructive operations.</li>
+                  <li>The displayed eligibility status is a best-effort evaluation and may not capture every runtime constraint Azure enforces (region capacity, RBAC, ASR replication state, etc.).</li>
+                  <li>Migration and deletion actions are <strong>irreversible without prior backups</strong>.</li>
+                </ul>
+                <p>Always review the disk list and the Activity Log before, during, and after every action. When in doubt, dry-run by reading the inventory view first.</p>
+              </div>
+
               <div class="docs-grid">
                 <article class="docs-section">
                   <h3>What it is</h3>
@@ -1080,7 +1308,10 @@ HTML = """<!doctype html>
     }
 
     async function fetchJson(url) {
-      const response = await fetch(url);
+      const headers = {};
+      const token = localStorage.getItem("dashboard-token");
+      if (token) headers["X-Dashboard-Token"] = token;
+      const response = await fetch(url, { headers });
       const payload = await response.json();
       if (!response.ok) {
         throw new Error(payload.error || "Request failed");
@@ -1088,10 +1319,75 @@ HTML = """<!doctype html>
       return payload;
     }
 
+    // -------- modal --------
+    const modalOverlay = document.getElementById("modalOverlay");
+    const modalEl = document.getElementById("modalEl");
+    const modalHeader = document.getElementById("modalHeader");
+    const modalTitle = document.getElementById("modalTitle");
+    const modalBody = document.getElementById("modalBody");
+    const modalConfirmRow = document.getElementById("modalConfirmRow");
+    const modalConfirmWord = document.getElementById("modalConfirmWord");
+    const modalConfirmInput = document.getElementById("modalConfirmInput");
+    const modalOkBtn = document.getElementById("modalOkBtn");
+    const modalCancelBtn = document.getElementById("modalCancelBtn");
+    const modalCloseBtn = document.getElementById("modalCloseBtn");
+
+    function showModal({ title, bodyHtml, confirmWord = null, okLabel = "Confirm", cancelLabel = "Cancel", danger = false, dismissible = true }) {
+      return new Promise((resolve) => {
+        modalTitle.textContent = title;
+        modalBody.innerHTML = bodyHtml;
+        modalOkBtn.textContent = okLabel;
+        modalCancelBtn.textContent = cancelLabel;
+        modalEl.classList.toggle("danger", danger);
+        modalHeader.classList.toggle("danger", danger);
+        modalCloseBtn.hidden = !dismissible;
+        if (confirmWord) {
+          modalConfirmRow.hidden = false;
+          modalConfirmWord.textContent = confirmWord;
+          modalConfirmInput.value = "";
+          modalOkBtn.disabled = true;
+          const onInput = () => { modalOkBtn.disabled = modalConfirmInput.value !== confirmWord; };
+          modalConfirmInput.addEventListener("input", onInput);
+          modalConfirmInput._dispose = () => modalConfirmInput.removeEventListener("input", onInput);
+        } else {
+          modalConfirmRow.hidden = true;
+          modalOkBtn.disabled = false;
+        }
+        const cleanup = () => {
+          modalOverlay.hidden = true;
+          modalOkBtn.removeEventListener("click", onOk);
+          modalCancelBtn.removeEventListener("click", onCancel);
+          modalCloseBtn.removeEventListener("click", onCancel);
+          document.removeEventListener("keydown", onKey);
+          if (modalConfirmInput._dispose) { modalConfirmInput._dispose(); modalConfirmInput._dispose = null; }
+        };
+        const onOk = () => { cleanup(); resolve(true); };
+        const onCancel = () => { cleanup(); resolve(false); };
+        const onKey = (ev) => {
+          if (ev.key === "Escape" && dismissible) onCancel();
+          if (ev.key === "Enter" && !modalOkBtn.disabled) onOk();
+        };
+        modalOkBtn.addEventListener("click", onOk);
+        modalCancelBtn.addEventListener("click", onCancel);
+        modalCloseBtn.addEventListener("click", onCancel);
+        document.addEventListener("keydown", onKey);
+        modalOverlay.hidden = false;
+        if (confirmWord) modalConfirmInput.focus();
+        else modalOkBtn.focus();
+      });
+    }
+
+    function escapeHtml(text) {
+      return String(text == null ? "" : text).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+    }
+
     async function postJson(url, payload) {
+      const headers = { "Content-Type": "application/json" };
+      const token = localStorage.getItem("dashboard-token");
+      if (token) headers["X-Dashboard-Token"] = token;
       const response = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify(payload)
       });
       const data = await response.json();
@@ -1515,8 +1811,25 @@ HTML = """<!doctype html>
         return;
       }
 
-      const confirmed = window.confirm(`Delete ${rows.length} selected unattached disk(s)?`);
+      const impact = rows.map(r => `<li>${escapeHtml(r.diskName)}  <span style="color:var(--muted)">(${escapeHtml(r.resourceGroup)}, ${escapeHtml(r.location || "")}, ${escapeHtml(r.sku || "")})</span></li>`).join("");
+      const confirmed = await showModal({
+        title: `Delete ${rows.length} unattached disk(s)?`,
+        danger: true,
+        confirmWord: "DELETE",
+        okLabel: "Permanently delete",
+        bodyHtml: `
+          <p>You are about to <strong>permanently delete</strong> the following unattached disk(s). This action <strong>cannot be undone</strong>.</p>
+          <div class="modal-impact"><ul>${impact}</ul></div>
+          <p>By proceeding you confirm that:</p>
+          <ul>
+            <li>You have the authority to delete these resources.</li>
+            <li>You have verified the scope with the affected workload owners.</li>
+            <li>You accept that this tool and its author bear <strong>no responsibility</strong> for data loss or service impact.</li>
+          </ul>
+        `,
+      });
       if (!confirmed) {
+        showNotice("Delete cancelled.");
         return;
       }
 
@@ -1583,8 +1896,31 @@ HTML = """<!doctype html>
         return;
       }
       const createBackupBefore = document.getElementById("backupBeforeMigration").checked;
-      const confirmed = window.confirm(`Migrate ${rows.length} selected disk(s) to PremiumV2_LRS?${createBackupBefore ? "\\n\\nSnapshots will be created first." : ""}`);
+      const impact = rows.map(r => `<li>${escapeHtml(r.diskName)}  <span style="color:var(--muted)">(${escapeHtml(r.resourceGroup)}${r.vmName ? ", attached to " + escapeHtml(r.vmName) : ", unattached"})</span></li>`).join("");
+      const backupLine = createBackupBefore
+        ? `<li>Create a snapshot of each disk (<strong>Backup Before Migration is ON</strong>).</li>`
+        : `<li><strong>No snapshot will be taken.</strong> Rollback will require an existing backup.</li>`;
+      const confirmed = await showModal({
+        title: `Migrate ${rows.length} disk(s) to PremiumV2_LRS?`,
+        danger: true,
+        confirmWord: "MIGRATE",
+        okLabel: "Migrate now",
+        bodyHtml: `
+          <p>You are about to migrate the following disk(s) to <code>PremiumV2_LRS</code>:</p>
+          <div class="modal-impact"><ul>${impact}</ul></div>
+          <p>What will happen:</p>
+          <ul>
+            <li>Deallocate any VM that owns a selected disk (<strong>causes downtime</strong>).</li>
+            ${backupLine}
+            <li>Change each disk SKU to <code>PremiumV2_LRS</code> (in-place conversion).</li>
+            <li>Restart the affected VM(s) once conversion completes.</li>
+          </ul>
+          <p>Azure may still reject the conversion at runtime for reasons not fully detectable in advance (capacity, RBAC, ASR replication, encryption settings, etc.).</p>
+          <p>By proceeding you accept that this tool and its author bear <strong>no responsibility</strong> for data loss, downtime, or service impact, and you confirm the timing with the affected workload owners.</p>
+        `,
+      });
       if (!confirmed) {
+        showNotice("Migration cancelled.");
         return;
       }
       try {
@@ -1650,7 +1986,79 @@ HTML = """<!doctype html>
     setActiveView("docs");
     updateSelectionCounts();
 
-    loadSubscriptions();
+    async function loadConfig() {
+      try {
+        const cfg = await fetchJson("/api/config");
+        state.config = cfg;
+        const banner = document.getElementById("modeBanner");
+        if (cfg.readOnly) {
+          banner.textContent = "READ-ONLY MODE — destructive actions are disabled on the server.";
+          banner.className = "mode-banner read-only";
+          banner.hidden = false;
+          for (const id of ["backupSelectedBtn","migrateSelectedBtn","deleteSelectedBtn"]) {
+            document.getElementById(id).disabled = true;
+          }
+        } else if (cfg.dryRun) {
+          banner.textContent = "DRY-RUN MODE — Azure state changes will be logged but not executed.";
+          banner.className = "mode-banner dry-run";
+          banner.hidden = false;
+        }
+        if (cfg.authRequired && !localStorage.getItem("dashboard-token")) {
+          const accepted = await showModal({
+            title: "Authentication required",
+            okLabel: "Save token",
+            cancelLabel: "Continue anonymously",
+            bodyHtml: `
+              <p>This server is configured to require an authentication token for state-changing actions. Paste the token printed on the server console:</p>
+              <p><input id="tokenEntry" style="width:100%;min-height:36px;padding:8px 12px;border-radius:8px;border:1px solid var(--line);font-family:ui-monospace,monospace;" autocomplete="off"></p>
+              <p style="color: var(--muted); font-size: 0.82rem;">Stored in your browser only. Read-only endpoints work without a token.</p>
+            `,
+          });
+          if (accepted) {
+            const tok = (document.getElementById("tokenEntry") || {}).value;
+            if (tok) localStorage.setItem("dashboard-token", tok.trim());
+          }
+        }
+      } catch (e) {
+        // Server config endpoint not reachable; keep dashboard usable but warn.
+      }
+    }
+
+    async function ensureDisclaimerAccepted() {
+      if (localStorage.getItem("disclaimer-accepted")) return;
+      document.body.classList.add("disclaimer-pending");
+      const accepted = await showModal({
+        title: "Disclaimer & limitation of liability",
+        dismissible: false,
+        confirmWord: "I AGREE",
+        okLabel: "Accept and continue",
+        cancelLabel: "Exit",
+        bodyHtml: `
+          <p>This software is provided <strong>"AS IS"</strong>, without warranty of any kind. The author and contributors accept no liability for any data loss, service interruption, downtime, or financial impact arising from the use of, or inability to use, this software.</p>
+          <p>By using the <strong>Migrate</strong>, <strong>Backup</strong>, or <strong>Delete</strong> features you acknowledge that:</p>
+          <ul>
+            <li>You have appropriate authorization to perform these actions on the target Azure resources.</li>
+            <li>You have verified the selected scope and confirmed the impact with the affected workload owners.</li>
+            <li>You have taken independent backups before destructive operations.</li>
+            <li>The displayed eligibility status is a best-effort evaluation and may not capture every runtime constraint Azure enforces.</li>
+            <li>Migration and deletion actions are <strong>irreversible without prior backups</strong>.</li>
+          </ul>
+          <p>Your acceptance is stored in this browser; you will not be prompted again unless you clear site data.</p>
+        `,
+      });
+      if (accepted) {
+        localStorage.setItem("disclaimer-accepted", new Date().toISOString());
+        document.body.classList.remove("disclaimer-pending");
+      } else {
+        document.body.innerHTML = "<div style='padding:60px;text-align:center;font-family:system-ui;color:#475569;'><h2>Session ended</h2><p>You declined the disclaimer. Close this tab to exit.</p></div>";
+      }
+    }
+
+    (async () => {
+      await loadConfig();
+      await ensureDisclaimerAccepted();
+      loadSubscriptions();
+    })();
   </script>
 </body>
 </html>
@@ -1658,6 +2066,10 @@ HTML = """<!doctype html>
 
 
 def run_az_json(arguments, subscription_id=None, timeout_seconds=90):
+    if DRY_RUN_MODE and is_state_changing(arguments):
+        # In dry-run mode, log the would-be command and return an empty dict.
+        return {"dryRun": True, "command": list(arguments)}
+
     az_executable = shutil.which("az") or shutil.which("az.cmd")
     if not az_executable:
         raise RuntimeError("Azure CLI executable was not found. Install Azure CLI or restart the terminal after installation.")
@@ -2123,6 +2535,10 @@ def _get_operation_status(op_id):
 
 def delete_unattached_disks(subscription_id, disks, log=None):
     deleted_count = 0
+    if len(disks) > MAX_MIGRATION_BATCH:
+        raise RuntimeError(f"Batch size {len(disks)} exceeds limit of {MAX_MIGRATION_BATCH}.")
+    if DRY_RUN_MODE:
+        _log(log, "DRY-RUN: state changes will be logged but not executed")
     _log(log, f"Deleting {len(disks)} unattached disk(s)")
 
     for disk in disks:
@@ -2151,6 +2567,15 @@ def delete_unattached_disks(subscription_id, disks, log=None):
 
     invalidate_payload_cache(subscription_id)
     _log(log, f"Done. Deleted {deleted_count} disk(s).")
+    audit_path = write_audit_entry(
+        "delete",
+        subscription_id,
+        disks,
+        result={"deletedCount": deleted_count},
+        dry_run=DRY_RUN_MODE,
+    )
+    if audit_path:
+        _log(log, f"Audit entry written to {audit_path}")
     return {"deletedCount": deleted_count}
 
 
@@ -2183,6 +2608,10 @@ def create_disk_snapshot(subscription_id, resource_group, disk_name, source_disk
 def migrate_disks(subscription_id, disks, create_backup_before=False, log=None):
     migrated_count = 0
     snapshot_count = 0
+    if len(disks) > MAX_MIGRATION_BATCH:
+        raise RuntimeError(f"Batch size {len(disks)} exceeds limit of {MAX_MIGRATION_BATCH}.")
+    if DRY_RUN_MODE:
+        _log(log, "DRY-RUN: state changes will be logged but not executed")
     _log(log, f"Starting migration of {len(disks)} disk(s){' with backup' if create_backup_before else ''}")
     _log(log, "Listing VMs to map attachments")
     vm_cache = run_az_json(["vm", "list"], subscription_id) or []
@@ -2270,11 +2699,24 @@ def migrate_disks(subscription_id, disks, create_backup_before=False, log=None):
 
     invalidate_payload_cache(subscription_id)
     _log(log, f"Done. Migrated {migrated_count} disk(s); created {snapshot_count} snapshot(s).")
+    audit_path = write_audit_entry(
+        "migrate",
+        subscription_id,
+        disks,
+        result={"migratedCount": migrated_count, "snapshotCount": snapshot_count},
+        dry_run=DRY_RUN_MODE,
+    )
+    if audit_path:
+        _log(log, f"Audit entry written to {audit_path}")
     return {"migratedCount": migrated_count, "snapshotCount": snapshot_count}
 
 
 def backup_disks(subscription_id, disks, log=None):
     snapshot_count = 0
+    if len(disks) > MAX_MIGRATION_BATCH:
+        raise RuntimeError(f"Batch size {len(disks)} exceeds limit of {MAX_MIGRATION_BATCH}.")
+    if DRY_RUN_MODE:
+        _log(log, "DRY-RUN: state changes will be logged but not executed")
     _log(log, f"Creating snapshots for {len(disks)} disk(s)")
     for disk in disks:
         resource_group = disk.get("resourceGroup")
@@ -2300,6 +2742,15 @@ def backup_disks(subscription_id, disks, log=None):
         _log(log, f"Snapshot '{snap_name}' created")
 
     _log(log, f"Done. Created {snapshot_count} snapshot(s).")
+    audit_path = write_audit_entry(
+        "backup",
+        subscription_id,
+        disks,
+        result={"snapshotCount": snapshot_count},
+        dry_run=DRY_RUN_MODE,
+    )
+    if audit_path:
+        _log(log, f"Audit entry written to {audit_path}")
     return {"snapshotCount": snapshot_count}
 
 
@@ -2313,6 +2764,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(HTML.encode("utf-8"))
                 return
+
+            if parsed.path == "/api/config":
+                return self.write_json({
+                    "readOnly": READ_ONLY_MODE,
+                    "dryRun": DRY_RUN_MODE,
+                    "authRequired": bool(AUTH_TOKEN),
+                    "maxMigrationBatch": MAX_MIGRATION_BATCH,
+                    "auditDir": AUDIT_DIR,
+                })
 
             if parsed.path == "/api/subscriptions":
                 return self.write_json({"subscriptions": get_subscriptions()})
@@ -2344,6 +2804,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             content_length = int(self.headers.get("Content-Length", "0"))
             raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
             payload = json.loads(raw_body.decode("utf-8"))
+
+            # Auth guard: state-changing endpoints require the configured token if any.
+            if AUTH_TOKEN and parsed.path.startswith("/api/"):
+                provided = self.headers.get("X-Dashboard-Token") or ""
+                if provided != AUTH_TOKEN:
+                    return self.write_json({"error": "Unauthorized"}, HTTPStatus.UNAUTHORIZED)
+
+            # Read-only guard: refuse state-changing operations.
+            if READ_ONLY_MODE and parsed.path in ("/api/delete-unattached", "/api/backup-disks", "/api/migrate-disks"):
+                return self.write_json(
+                    {"error": "Dashboard is in read-only mode. Set DISK_DASHBOARD_READONLY=0 to allow writes."},
+                    HTTPStatus.FORBIDDEN,
+                )
 
             if parsed.path == "/api/delete-unattached":
                 subscription_id = payload.get("subscriptionId")
@@ -2405,6 +2878,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
 def main():
     server = ThreadingHTTPServer((HOST, PORT), DashboardHandler)
     print(f"Azure Disk Dashboard running at http://{HOST}:{PORT}")
+    print(f"  Mode:         {'READ-ONLY' if READ_ONLY_MODE else 'READ-WRITE'}"
+          f"{' + DRY-RUN' if DRY_RUN_MODE else ''}")
+    print(f"  Auth:         {'token required (X-Dashboard-Token header)' if AUTH_TOKEN else 'open'}")
+    print(f"  Batch limit:  {MAX_MIGRATION_BATCH} disks per migrate/backup/delete")
+    print(f"  Audit log:    {AUDIT_DIR}")
     print("Use Ctrl+C to stop the server.")
     try:
         server.serve_forever()

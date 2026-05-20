@@ -1,5 +1,7 @@
+import json
 import os
 import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -584,6 +586,171 @@ class TestOperationRegistry(unittest.TestCase):
 
     def test_get_status_unknown_op(self):
         self.assertIsNone(app._get_operation_status("not-a-real-op-id"))
+
+
+# ---------- safety / hardening ----------
+
+class TestIsStateChanging(unittest.TestCase):
+    def test_disk_update_is_state_changing(self):
+        self.assertTrue(app.is_state_changing(["disk", "update", "--name", "d"]))
+
+    def test_disk_delete_is_state_changing(self):
+        self.assertTrue(app.is_state_changing(["disk", "delete", "--name", "d"]))
+
+    def test_snapshot_create_is_state_changing(self):
+        self.assertTrue(app.is_state_changing(["snapshot", "create"]))
+
+    def test_vm_deallocate_is_state_changing(self):
+        self.assertTrue(app.is_state_changing(["vm", "deallocate"]))
+
+    def test_disk_list_is_read_only(self):
+        self.assertFalse(app.is_state_changing(["disk", "list"]))
+
+    def test_vm_list_is_read_only(self):
+        self.assertFalse(app.is_state_changing(["vm", "list"]))
+
+    def test_empty_is_safe(self):
+        self.assertFalse(app.is_state_changing([]))
+
+
+class TestDryRunMode(unittest.TestCase):
+    def test_dry_run_returns_stub_for_state_change(self):
+        with mock.patch.object(app, "DRY_RUN_MODE", True):
+            result = app.run_az_json(["disk", "update", "--name", "d"])
+        self.assertEqual(result, {"dryRun": True, "command": ["disk", "update", "--name", "d"]})
+
+    def test_dry_run_does_not_short_circuit_reads(self):
+        # Read-only commands should still go through subprocess.run.
+        with mock.patch.object(app, "DRY_RUN_MODE", True), \
+             mock.patch("app.subprocess.run") as mock_run, \
+             mock.patch("app.shutil.which", return_value="/usr/bin/az"):
+            mock_run.return_value = mock.Mock(returncode=0, stdout="[]", stderr="")
+            result = app.run_az_json(["disk", "list"])
+        self.assertEqual(result, [])
+        mock_run.assert_called_once()
+
+
+class TestAuditLog(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.patch = mock.patch.object(app, "AUDIT_DIR", self.tmp)
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+
+    def test_audit_writes_one_line_per_call(self):
+        path = app.write_audit_entry(
+            "migrate",
+            "subX",
+            [{"resourceGroup": "rg", "diskName": "d1"}],
+            result={"migratedCount": 1, "snapshotCount": 0},
+            dry_run=False,
+        )
+        self.assertIsNotNone(path)
+        self.assertTrue(os.path.exists(path))
+        with open(path, encoding="utf-8") as fh:
+            line = fh.readline().strip()
+        entry = json.loads(line)
+        self.assertEqual(entry["action"], "migrate")
+        self.assertEqual(entry["subscriptionId"], "subX")
+        self.assertEqual(entry["diskCount"], 1)
+        self.assertFalse(entry["dryRun"])
+        self.assertEqual(entry["disks"][0]["diskName"], "d1")
+        self.assertIn("ts", entry)
+
+    def test_audit_records_error_field(self):
+        path = app.write_audit_entry(
+            "delete", "subX",
+            [{"resourceGroup": "rg", "diskName": "d"}],
+            error="Disk is attached",
+        )
+        with open(path, encoding="utf-8") as fh:
+            entry = json.loads(fh.readline())
+        self.assertEqual(entry["error"], "Disk is attached")
+        self.assertIsNone(entry["result"])
+
+    def test_audit_appends_multiple_lines(self):
+        app.write_audit_entry("backup", "subX", [{"resourceGroup": "rg", "diskName": "d1"}])
+        app.write_audit_entry("backup", "subX", [{"resourceGroup": "rg", "diskName": "d2"}])
+        date_str = time.strftime("%Y-%m-%d", time.gmtime())
+        path = os.path.join(self.tmp, f"audit-{date_str}.jsonl")
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+        self.assertEqual(len(lines), 2)
+
+    def test_audit_failure_does_not_raise(self):
+        # Force makedirs to fail by using a temp file as the "directory".
+        with tempfile.NamedTemporaryFile(delete=False) as fh:
+            blocking_path = fh.name
+        try:
+            broken_dir = os.path.join(blocking_path, "subdir-that-cant-exist")
+            with mock.patch.object(app, "AUDIT_DIR", broken_dir):
+                # Should not raise even though we can't create the directory.
+                result = app.write_audit_entry("migrate", "x", [])
+            self.assertIsNone(result)
+        finally:
+            os.unlink(blocking_path)
+
+
+class TestBatchSizeCap(unittest.TestCase):
+    def test_migrate_rejects_batch_above_cap(self):
+        disks = [{"resourceGroup": "rg", "diskName": f"d{i}"} for i in range(3)]
+        with mock.patch.object(app, "MAX_MIGRATION_BATCH", 2):
+            with self.assertRaises(RuntimeError) as ctx:
+                app.migrate_disks("subX", disks)
+        self.assertIn("Batch size", str(ctx.exception))
+
+    def test_backup_rejects_batch_above_cap(self):
+        disks = [{"resourceGroup": "rg", "diskName": f"d{i}"} for i in range(3)]
+        with mock.patch.object(app, "MAX_MIGRATION_BATCH", 2):
+            with self.assertRaises(RuntimeError) as ctx:
+                app.backup_disks("subX", disks)
+        self.assertIn("Batch size", str(ctx.exception))
+
+    def test_delete_rejects_batch_above_cap(self):
+        disks = [{"resourceGroup": "rg", "diskName": f"d{i}"} for i in range(3)]
+        with mock.patch.object(app, "MAX_MIGRATION_BATCH", 2):
+            with self.assertRaises(RuntimeError) as ctx:
+                app.delete_unattached_disks("subX", disks)
+        self.assertIn("Batch size", str(ctx.exception))
+
+
+class TestEnvBoolHelper(unittest.TestCase):
+    def test_true_values(self):
+        for value in ("1", "true", "TRUE", "yes", "on", " On "):
+            with mock.patch.dict(os.environ, {"TEST_FLAG_X": value}):
+                self.assertTrue(app._env_bool("TEST_FLAG_X"), value)
+
+    def test_false_values(self):
+        for value in ("", "0", "false", "no", "off", "anything-else"):
+            with mock.patch.dict(os.environ, {"TEST_FLAG_X": value}):
+                self.assertFalse(app._env_bool("TEST_FLAG_X"), value)
+
+
+class TestMigrateEndToEndAuditAndDryRun(unittest.TestCase):
+    @mock.patch("app.run_az_json")
+    def test_audit_entry_written_after_successful_migrate(self, mock_az):
+        tmp = tempfile.mkdtemp()
+        disk_json = make_disk(name="data1")
+        mock_az.side_effect = [
+            [],         # vm list
+            disk_json,  # disk show
+            {},         # disk update
+        ]
+        with mock.patch.object(app, "AUDIT_DIR", tmp):
+            app.migrate_disks(
+                "subX",
+                [{"resourceGroup": "rg", "diskName": "data1"}],
+                create_backup_before=False,
+            )
+        date_str = time.strftime("%Y-%m-%d", time.gmtime())
+        path = os.path.join(tmp, f"audit-{date_str}.jsonl")
+        self.assertTrue(os.path.exists(path))
+        with open(path, encoding="utf-8") as fh:
+            entry = json.loads(fh.readline())
+        self.assertEqual(entry["action"], "migrate")
+        self.assertEqual(entry["result"]["migratedCount"], 1)
 
 
 if __name__ == "__main__":
