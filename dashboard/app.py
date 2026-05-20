@@ -560,16 +560,20 @@ HTML = """<!doctype html>
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 12px;
+      gap: 16px;
+      flex-wrap: wrap;
       color: var(--muted);
       font-size: 0.85rem;
     }
-    .footer-copy { line-height: 1.45; }
+    .footer-copy { flex: 1 1 280px; min-width: 0; line-height: 1.45; }
     .footer-note strong { color: var(--ink); }
     .footer-links {
       display: flex;
       gap: 8px;
       flex-wrap: wrap;
+      justify-content: flex-end;
+      align-items: center;
+      max-width: 100%;
     }
     .email-btn, .website-btn {
       display: inline-flex;
