@@ -158,4 +158,4 @@ Operators are solely responsible for the consequences of any action initiated th
 
 Vikram Vunduru  
 Portfolio: https://www.vikramvunduru.com  
-For support, email: vikram.vunduru@gmail.com
+For support, email: vikram.vunduru@gmail.com or hi@vikramvunduru.com

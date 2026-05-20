@@ -1250,7 +1250,7 @@ HTML = """<!doctype html>
         <div class="footer-note">
           <div class="footer-copy">
             Author: <strong>Vikram Vunduru</strong><br>
-            More work at <a href="https://www.vikramvunduru.com" target="_blank" rel="noopener noreferrer">vikramvunduru.com</a>. For support, email <a href="mailto:vikram.vunduru@gmail.com">vikram.vunduru@gmail.com</a>.
+            More work at <a href="https://www.vikramvunduru.com" target="_blank" rel="noopener noreferrer">vikramvunduru.com</a>. For support, email <a href="mailto:vikram.vunduru@gmail.com">vikram.vunduru@gmail.com</a> or <a href="mailto:hi@vikramvunduru.com">hi@vikramvunduru.com</a>.
           </div>
           <div class="footer-links">
             <a class="website-btn" href="https://www.vikramvunduru.com" target="_blank" rel="noopener noreferrer">
@@ -1259,7 +1259,11 @@ HTML = """<!doctype html>
             </a>
             <a class="email-btn" href="mailto:vikram.vunduru@gmail.com">
               <span aria-hidden="true">&#x2709;</span>
-              <span>Email</span>
+              <span>vikram.vunduru@gmail.com</span>
+            </a>
+            <a class="email-btn" href="mailto:hi@vikramvunduru.com">
+              <span aria-hidden="true">&#x2709;</span>
+              <span>hi@vikramvunduru.com</span>
             </a>
           </div>
         </div>
